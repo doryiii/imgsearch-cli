@@ -208,29 +208,46 @@ def test_cli_shorthand_and_output_modes(tmp_path: Path, monkeypatch, capsys):
   transport, _ = make_mock_transport()
   orig_client = imgsearch.EmbeddingClient
 
-  def patched_client(base_url=imgsearch.DEFAULT_ENDPOINT, model_id=imgsearch.DEFAULT_MODEL):
+  def patched_client(base_url, model_id=imgsearch.DEFAULT_MODEL):
     return orig_client(base_url=base_url, model_id=model_id, transport=transport)
 
   monkeypatch.setattr(imgsearch, "EmbeddingClient", patched_client)
 
-  rc = imgsearch.main(["index", str(root), "--db", str(db_path), "-q"])
+  rc = imgsearch.main(
+      ["index", str(root), "--db", str(db_path), "--endpoint", "http://mock:8091", "-q"]
+  )
   assert rc == 0
 
   # Shorthand `imgsearch "terminal" ...` dispatches to `search`
-  rc = imgsearch.main(["terminal", "--db", str(db_path), "--json", "-n", "1"])
+  rc = imgsearch.main(
+      ["terminal", "--db", str(db_path), "--endpoint", "http://mock:8091", "--json", "-n", "1"]
+  )
   assert rc == 0
   out = json.loads(capsys.readouterr().out)
   assert len(out) == 1
   assert out[0]["rel_path"] == "terminal_err.png"
 
   # `-l` / `--paths-only`
-  rc = imgsearch.main(["search", "browser", "--db", str(db_path), "-l", "--abs", "-n", "1"])
+  rc = imgsearch.main(
+      [
+          "search",
+          "browser",
+          "--db",
+          str(db_path),
+          "--endpoint",
+          "http://mock:8091",
+          "-l",
+          "--abs",
+          "-n",
+          "1",
+      ]
+  )
   assert rc == 0
   line = capsys.readouterr().out.strip()
   assert line == str((root / "browser_tab.png").resolve())
 
   # `status --json`
-  rc = imgsearch.main(["status", "--db", str(db_path), "--json"])
+  rc = imgsearch.main(["status", "--db", str(db_path), "--endpoint", "http://mock:8091", "--json"])
   assert rc == 0
   st = json.loads(capsys.readouterr().out)
   assert st["embedded"] == 2
@@ -287,19 +304,41 @@ def test_thumbnail_renderers_and_cli_flags(tmp_path: Path, monkeypatch, capsys):
   transport, _ = make_mock_transport()
   orig_client = imgsearch.EmbeddingClient
 
-  def patched_client(base_url=imgsearch.DEFAULT_ENDPOINT, model_id=imgsearch.DEFAULT_MODEL):
+  def patched_client(base_url, model_id=imgsearch.DEFAULT_MODEL):
     return orig_client(base_url=base_url, model_id=model_id, transport=transport)
 
   monkeypatch.setattr(imgsearch, "EmbeddingClient", patched_client)
-  assert imgsearch.main(["index", str(root), "--db", str(db_path), "-q"]) == 0
+  assert (
+      imgsearch.main(
+          ["index", str(root), "--db", str(db_path), "--endpoint", "http://mock:8091", "-q"]
+      )
+      == 0
+  )
 
-  assert imgsearch.main(["-t", "kitty", "--db", str(db_path), "-n", "1"]) == 0
+  assert (
+      imgsearch.main(
+          ["-t", "kitty", "--db", str(db_path), "--endpoint", "http://mock:8091", "-n", "1"]
+      )
+      == 0
+  )
   out_auto = capsys.readouterr().out
   assert "terminal_sample.png" in out_auto
   assert ("▀" in out_auto) or ("\x1b_Ga=T" in out_auto) or ("\x1bP" in out_auto)
 
   assert (
-      imgsearch.main(["--thumb=kitty", "--thumb-rows", "5", "terminal", "--db", str(db_path)]) == 0
+      imgsearch.main(
+          [
+              "--thumb=kitty",
+              "--thumb-rows",
+              "5",
+              "terminal",
+              "--db",
+              str(db_path),
+              "--endpoint",
+              "http://mock:8091",
+          ]
+      )
+      == 0
   )
   out_kitty = capsys.readouterr().out
   assert "\x1b_Ga=T,f=100,r=5,q=2" in out_kitty
@@ -383,7 +422,7 @@ def test_auto_select_first_embedding_model_and_cwd_defaults(tmp_path: Path, monk
   transport = httpx.MockTransport(router_handler)
   orig_client = imgsearch.EmbeddingClient
 
-  def patched_client(base_url=imgsearch.DEFAULT_ENDPOINT, model_id=imgsearch.DEFAULT_MODEL):
+  def patched_client(base_url, model_id=imgsearch.DEFAULT_MODEL):
     return orig_client(base_url=base_url, model_id=model_id, transport=transport)
 
   monkeypatch.setattr(imgsearch, "EmbeddingClient", patched_client)
@@ -391,14 +430,14 @@ def test_auto_select_first_embedding_model_and_cwd_defaults(tmp_path: Path, monk
 
   (tmp_path / "shot.png").write_bytes(PNG_HEADER + b"terminal")
 
-  # Run `imgsearch index` with NO --endpoint, NO --model, NO --db, NO root!
-  assert imgsearch.main(["index", "-q"]) == 0
+  # Run `imgsearch index` with --endpoint, NO --model, NO --db, NO root!
+  assert imgsearch.main(["index", "--endpoint", "http://localhost:8080", "-q"]) == 0
   assert (tmp_path / "index.db").exists()
   assert calls[0][0] == "http://localhost:8080/v1/embeddings"
   assert calls[0][1]["model"] == "embeddinggemma-2"  # skipped gemma-4, picked first embed model
 
-  # Run `imgsearch "terminal"` with NO flags -> uses cwd `index.db` + indexed model
-  assert imgsearch.main(["terminal", "--json"]) == 0
+  # Run `imgsearch "terminal" --endpoint ...` -> uses cwd `index.db` + indexed model
+  assert imgsearch.main(["terminal", "--endpoint", "http://localhost:8080", "--json"]) == 0
   out = json.loads(capsys.readouterr().out)
   assert len(out) == 1
   assert out[0]["path"] == "shot.png"
@@ -411,3 +450,134 @@ def test_auto_select_first_embedding_model_and_cwd_defaults(tmp_path: Path, monk
   with orig_client("http://localhost:8080", None, transport=chat_only) as client:
     with pytest.raises(imgsearch.ModelMismatch, match="no embedding model found"):
       client.verify()
+
+
+def test_local_default_weights_dir_and_cross_backend_interop(tmp_path: Path, monkeypatch, capsys):
+  import huggingface_hub
+  from PIL import Image
+  import local_embed
+
+  assert local_embed.build_selective_config_kwargs(
+      "google/embeddinggemma-2", need_vision=False
+  ) == {
+      "vision_config": None,
+      "audio_config": None,
+  }
+  assert local_embed.build_selective_config_kwargs("google/embeddinggemma-2", need_vision=True) == {
+      "audio_config": None,
+  }
+  assert local_embed.build_selective_config_kwargs("BAAI/bge-m3", need_vision=False) == {}
+
+  # Verify `resolve_weights_dir` defaults to `./models/<slug>` and respects `--model-dir`
+  monkeypatch.chdir(tmp_path)
+  assert local_embed.resolve_weights_dir("google/embeddinggemma-2") == Path(
+      "models/embeddinggemma-2"
+  )
+  assert local_embed.resolve_weights_dir("google/embeddinggemma-2", tmp_path / "custom_w") == (
+      tmp_path / "custom_w"
+  )
+
+  # Verify `ensure_weights_downloaded` downloads once and skips once files exist
+  dl_calls: list[tuple[str, str]] = []
+
+  def fake_snapshot_download(repo_id: str, local_dir: str, **_kwargs):
+    dl_calls.append((repo_id, local_dir))
+    p = Path(local_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    (p / "config.json").write_text('{"model_type": "embedding_gemma2"}', encoding="utf-8")
+    (p / "model.safetensors").write_bytes(b"weights")
+    return local_dir
+
+  monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+  target_wdir = tmp_path / "models" / "embeddinggemma-2"
+  local_embed.ensure_weights_downloaded("google/embeddinggemma-2", target_wdir)
+  local_embed.ensure_weights_downloaded("google/embeddinggemma-2", target_wdir)
+  assert len(dl_calls) == 1  # second call skipped because weights already exist!
+  # Even with an unrelated model name, config.json detection triggers Gemma 2 selective loading
+  assert local_embed.build_selective_config_kwargs(
+      "custom-name", need_vision=False, weights_dir=target_wdir
+  ) == {"vision_config": None, "audio_config": None}
+
+  # Put a dummy PNG inside `models/` to verify `discover_images` ignores model weight directories
+  (target_wdir / "banner.png").write_bytes(PNG_HEADER + b"ignore me")
+
+  load_calls: list[tuple[str, Path, bool, str | None]] = []
+
+  class FakeSentenceTransformer:
+    prompts = {"SearchQuery": imgsearch.QUERY_PREFIX}
+
+    def encode(
+        self,
+        inputs,
+        prompt_name=None,
+        batch_size=32,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    ):
+      if isinstance(inputs, str):
+        assert prompt_name == "SearchQuery"
+        return np.asarray(_fake_vec_for_tag(inputs), dtype=np.float32)
+      vecs = []
+      for item in inputs:
+        r, _g, _b = item["image"].getpixel((0, 0))
+        tag = "terminal" if r > 100 else "browser"
+        vecs.append(_fake_vec_for_tag(tag))
+      return np.asarray(vecs, dtype=np.float32)
+
+  def fake_loader(hf_model_id: str, weights_dir: Path, need_vision: bool, device: str | None):
+    load_calls.append((hf_model_id, weights_dir, need_vision, device))
+    return FakeSentenceTransformer()
+
+  img1 = tmp_path / "first.png"
+  Image.new("RGB", (16, 16), (200, 10, 10)).save(img1, format="PNG")
+  db_path = tmp_path / "index.db"
+
+  # 1. Index img1 via remote llama.cpp client (stamps 'ggmlorg-embeddinggemma-2-BF16')
+  transport, _ = make_mock_transport(served_model="ggmlorg-embeddinggemma-2-BF16")
+  with imgsearch.EmbeddingClient("http://mock:8091", "embeddinggemma-2", transport=transport) as rc:
+    s1 = imgsearch.build_index(tmp_path, db_path, rc, quiet=True)
+    assert s1["embedded"] == 1  # `models/.../banner.png` was ignored!
+
+  # 2. Search locally (text-only: need_vision=False!) against the remote-indexed DB
+  with local_embed.LocalEmbeddingClient(mode="text", device="cpu", loader=fake_loader) as lc:
+    hits = imgsearch.search_text("terminal", db_path, lc, limit=5)
+    assert len(hits) == 1
+    assert hits[0]["rel_path"] == "first.png"
+    assert load_calls == [
+        ("google/embeddinggemma-2", Path("models/embeddinggemma-2"), False, "cpu")
+    ]
+
+  # 3. `similar` on an already-indexed image loads ZERO weights!
+  load_calls.clear()
+  with local_embed.LocalEmbeddingClient(mode="vision", device="cpu", loader=fake_loader) as lc_sim:
+    sim = imgsearch.search_similar(img1, db_path, lc_sim, include_self=True)
+    assert len(sim) == 1
+    assert load_calls == []
+
+  # 4. Add img2 and run local `build_index` -> keeps img1 up_to_date and embeds only img2!
+  img2 = tmp_path / "second.png"
+  Image.new("RGB", (16, 16), (10, 200, 10)).save(img2, format="PNG")
+  with local_embed.LocalEmbeddingClient(mode="vision", device="cpu", loader=fake_loader) as lc_idx:
+    s2 = imgsearch.build_index(tmp_path, db_path, lc_idx, quiet=True)
+    assert s2["up_to_date"] == 1
+    assert s2["embedded"] == 1
+    assert load_calls == [("google/embeddinggemma-2", Path("models/embeddinggemma-2"), True, "cpu")]
+
+  # 5. CLI with NO `--endpoint` defaults to local backend and honors `--model-dir`!
+  load_calls.clear()
+  orig_local = imgsearch.LocalEmbeddingClient
+  monkeypatch.setattr(
+      imgsearch,
+      "LocalEmbeddingClient",
+      lambda model_id=None, model_dir=None, mode="text", device=None: orig_local(
+          model_id=model_id, model_dir=model_dir, mode=mode, device=device, loader=fake_loader
+      ),
+  )
+  custom_dir = tmp_path / "my_weights"
+  assert (
+      imgsearch.main(["terminal", "--model-dir", str(custom_dir), "--device", "cpu", "--json"]) == 0
+  )
+  cli_hits = json.loads(capsys.readouterr().out)
+  assert len(cli_hits) == 2
+  assert load_calls == [("google/embeddinggemma-2", custom_dir, False, "cpu")]

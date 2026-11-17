@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "imgsearch"
 version = "0.1.0"
@@ -9,8 +13,19 @@ dependencies = [
     "pillow",
 ]
 
+[project.optional-dependencies]
+local = [
+    "sentence-transformers>=6.1.0",
+    "transformers>=5.18.0",
+    "safetensors",
+    "torch",
+]
+
 [project.scripts]
 imgsearch = "imgsearch:main"
+
+[tool.setuptools]
+py-modules = ["imgsearch", "embed_base", "remote_embed", "local_embed"]
 
 [tool.pyink]
 pyink = true

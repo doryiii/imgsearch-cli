@@ -24,294 +24,40 @@ import sys
 import time
 from urllib.request import pathname2url
 
-import httpx
+import httpx  # noqa: F401
 import numpy as np
 
-DEFAULT_ENDPOINT = os.environ.get("EMBED_ENDPOINT", "http://localhost:8080")
-DEFAULT_MODEL = os.environ.get("EMBED_MODEL") or None
+from embed_base import (
+    EmbedError,
+    EmbeddingBackend,
+    EndpointUnreachable,
+    EXT_MIMES,
+    IMAGE_EXTENSIONS,
+    ItemRejected,
+    ModelMismatch,
+    QUERY_PREFIX,
+    detect_mime,
+    is_embeddinggemma2,
+    models_compatible,
+    normalize,
+    resolve_local_hf_model,
+)
+from local_embed import (
+    DEFAULT_DEVICE,
+    DEFAULT_MODEL_DIR,
+    DEFAULT_MODELS_BASE,
+    LocalEmbeddingClient,
+)
+from remote_embed import DEFAULT_ENDPOINT, DEFAULT_MODEL, EmbeddingClient
+
 DEFAULT_ROOT = Path(".")
 DEFAULT_DB = Path("index.db")
-
-EMBED_PATH = "/v1/embeddings"
-MODELS_PATH = "/v1/models"
-QUERY_PREFIX = "task: search result | query: "
-PROBE_TIMEOUT = 5.0
-REQUEST_TIMEOUT = 300.0
 DEFAULT_BATCH_SIZE = 8
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
-EXT_MIMES = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-    ".bmp": "image/bmp",
-}
 SUBCOMMANDS = {"index", "search", "similar", "status"}
 THUMB_BACKENDS = ("auto", "kitty", "sixel", "ansi")
 DEFAULT_THUMB_ROWS = 10
 THUMB_INDENT = "    "
-
-
-class EmbedError(Exception):
-  """Base error for embedding endpoint failures."""
-
-
-class EndpointUnreachable(EmbedError):
-  """Connection error, timeout, 5xx, or malformed response."""
-
-
-class ModelMismatch(EmbedError):
-  """Endpoint is serving a model that does not match configured model_id."""
-
-
-class ItemRejected(EmbedError):
-  """Endpoint rejected the payload with a 4xx status."""
-
-
-def detect_mime(data: bytes, path: Path | None = None) -> str:
-  """Detect image MIME type from magic bytes with file-extension fallback."""
-  if data.startswith(b"\x89PNG\r\n\x1a\n"):
-    return "image/png"
-  if data.startswith(b"\xff\xd8\xff"):
-    return "image/jpeg"
-  if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-    return "image/webp"
-  if data.startswith((b"GIF87a", b"GIF89a")):
-    return "image/gif"
-  if data.startswith(b"BM"):
-    return "image/bmp"
-  if path is not None:
-    return EXT_MIMES.get(path.suffix.lower(), "image/png")
-  return "image/png"
-
-
-def normalize(vector) -> np.ndarray:
-  """Defensive L2 normalization to float32."""
-  arr = np.asarray(vector, dtype=np.float32)
-  norm = float(np.linalg.norm(arr))
-  return arr / norm if norm > 0 else arr
-
-
-EMBED_NAME_TOKENS = ("embed", "bge-", "bge_", "e5-", "gte-", "siglip", "jina-clip")
-
-
-def _parse_models(payload: dict) -> list[dict]:
-  """Normalize OpenAI `data[]` and llama.cpp/Ollama `models[]` entries in list order."""
-  raw_data = payload.get("data") if isinstance(payload.get("data"), list) else []
-  raw_models = payload.get("models") if isinstance(payload.get("models"), list) else []
-
-  models_by_id: dict[str, dict] = {}
-  for m in raw_models:
-    if isinstance(m, dict):
-      mid = m.get("model") or m.get("name") or m.get("id")
-      if mid:
-        models_by_id[str(mid)] = m
-
-  parsed: list[dict] = []
-  source = raw_data if raw_data else raw_models
-  for idx, item in enumerate(source):
-    if not isinstance(item, dict):
-      continue
-    model_id = item.get("id") or item.get("model") or item.get("name")
-    if not model_id:
-      continue
-    model_id = str(model_id)
-    companion = models_by_id.get(model_id) or (
-        raw_models[idx]
-        if raw_data and idx < len(raw_models) and isinstance(raw_models[idx], dict)
-        else {}
-    )
-    arch = item.get("architecture") if isinstance(item.get("architecture"), dict) else {}
-    status = item.get("status") if isinstance(item.get("status"), dict) else {}
-    details = companion.get("details") if isinstance(companion.get("details"), dict) else {}
-    raw_caps = companion.get("capabilities") or item.get("capabilities") or []
-    raw_tags = (item.get("tags") or []) + (companion.get("tags") or [])
-    raw_aliases = item.get("aliases") or companion.get("aliases") or []
-    raw_args = status.get("args") or []
-
-    parsed.append(
-        {
-            "id": model_id,
-            "aliases": [str(a) for a in raw_aliases if a],
-            "capabilities": [str(c).lower() for c in raw_caps if c],
-            "type": str(companion.get("type") or item.get("type") or "").lower(),
-            "tags": [str(t).lower() for t in raw_tags if t],
-            "output_modalities": [
-                str(x).lower() for x in (arch.get("output_modalities") or []) if x
-            ],
-            "status_args": [str(a).lower() for a in raw_args if a],
-            "family": str(details.get("family") or "").lower(),
-        }
-    )
-  return parsed
-
-
-def _is_embedding_model(entry: dict) -> bool:
-  """Return True if a `/v1/models` entry looks like an embedding model."""
-  if any("embed" in c for c in entry["capabilities"]):
-    return True
-  if "embed" in entry["type"]:
-    return True
-  if any("embed" in m for m in entry["output_modalities"]):
-    return True
-  if any("embed" in t for t in entry["tags"]):
-    return True
-  if any(a.startswith("--embedding") for a in entry["status_args"]):
-    return True
-
-  names = [entry["id"], *entry["aliases"], entry["family"]]
-  for name in names:
-    low = name.lower()
-    if any(tok in low for tok in EMBED_NAME_TOKENS):
-      return True
-  return False
-
-
-class EmbeddingClient:
-  """Client for llama.cpp's multimodal `/v1/embeddings` endpoint."""
-
-  def __init__(
-      self,
-      base_url: str = DEFAULT_ENDPOINT,
-      model_id: str | None = DEFAULT_MODEL,
-      transport=None,
-  ):
-    self.base_url = base_url.rstrip("/")
-    self.model_id = model_id
-    self.served_model: str | None = None
-    self._client = httpx.Client(
-        transport=transport,
-        timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=PROBE_TIMEOUT),
-    )
-    self._verified = False
-
-  def close(self) -> None:
-    self._client.close()
-
-  def __enter__(self) -> EmbeddingClient:
-    return self
-
-  def __exit__(self, *exc) -> None:
-    self.close()
-
-  def probe(self) -> dict:
-    """Query GET /v1/models for reachability and resolve target or first embedding model."""
-    try:
-      resp = self._client.get(self.base_url + MODELS_PATH, timeout=PROBE_TIMEOUT)
-      resp.raise_for_status()
-      entries = _parse_models(resp.json())
-      available = [e["id"] for e in entries]
-      embed_models = [e["id"] for e in entries if _is_embedding_model(e)]
-
-      if self.model_id:
-        needle = self.model_id.lower()
-        matched = next(
-            (
-                e["id"]
-                for e in entries
-                if needle in e["id"].lower() or any(needle in a.lower() for a in e["aliases"])
-            ),
-            None,
-        )
-        return {
-            "reachable": True,
-            "served_model": matched or (available[0] if available else None),
-            "available_models": available,
-            "embedding_models": embed_models,
-            "matches": matched is not None,
-        }
-
-      selected = embed_models[0] if embed_models else None
-      return {
-          "reachable": True,
-          "served_model": selected,
-          "available_models": available,
-          "embedding_models": embed_models,
-          "matches": selected is not None,
-      }
-    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
-      return {
-          "reachable": False,
-          "served_model": None,
-          "available_models": [],
-          "embedding_models": [],
-          "matches": False,
-          "error": str(exc),
-      }
-
-  def verify(self) -> str:
-    """Ensure endpoint is reachable and serves the expected (or an embedding) model."""
-    info = self.probe()
-    if not info["reachable"]:
-      detail = f": {info['error']}" if info.get("error") else ""
-      raise EndpointUnreachable(f"cannot reach {self.base_url}{detail}")
-    if not info["matches"]:
-      avail = ", ".join(info["available_models"]) or "none"
-      if self.model_id is None:
-        raise ModelMismatch(
-            f"no embedding model found at {self.base_url} (available: {avail}); "
-            "pass --model to specify one"
-        )
-      raise ModelMismatch(
-          f"model {self.model_id!r} not found at {self.base_url} (available: {avail})"
-      )
-    self.served_model = info["served_model"]
-    if self.model_id is None:
-      self.model_id = self.served_model
-    self._verified = True
-    return self.served_model
-
-  def embed_images(self, items: list[tuple[bytes, str]]) -> list[np.ndarray]:
-    """Embed a batch of `(raw_bytes, mime_type)` image items."""
-    if not items:
-      return []
-    if not self._verified:
-      self.verify()
-    payload = {
-        "model": self.served_model,
-        "input": [
-            {
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-                        },
-                    }
-                ]
-            }
-            for raw, mime in items
-        ],
-    }
-    vectors = self._post(payload, expected=len(items))
-    return [normalize(v) for v in vectors]
-
-  def embed_text(self, query: str) -> np.ndarray:
-    """Embed a search query using EmbeddingGemma's query prefix."""
-    if not self._verified:
-      self.verify()
-    vectors = self._post({"model": self.served_model, "input": QUERY_PREFIX + query}, expected=1)
-    return normalize(vectors[0])
-
-  def _post(self, payload: dict, expected: int) -> list:
-    try:
-      resp = self._client.post(self.base_url + EMBED_PATH, json=payload)
-    except httpx.HTTPError as exc:
-      raise EndpointUnreachable(str(exc)) from exc
-    if resp.status_code >= 500 or resp.status_code in (408, 429):
-      raise EndpointUnreachable(f"HTTP {resp.status_code}: {resp.text[:200]}")
-    if resp.status_code >= 400:
-      raise ItemRejected(f"HTTP {resp.status_code}: {resp.text[:200]}")
-    try:
-      data = resp.json()["data"]
-      vectors = [item["embedding"] for item in data]
-    except (ValueError, KeyError, TypeError) as exc:
-      raise EndpointUnreachable("malformed embedding response") from exc
-    if len(vectors) != expected:
-      raise EndpointUnreachable(f"expected {expected} vectors, got {len(vectors)}")
-    return vectors
 
 
 SCHEMA_SQL = """
@@ -379,16 +125,34 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
   )
 
 
-def discover_images(root: Path, db_path: Path) -> list[Path]:
-  """Recursively find image files under `root`, skipping hidden files/dirs."""
+def discover_images(
+    root: Path,
+    db_path: Path,
+    exclude_dirs: list[Path] | None = None,
+) -> list[Path]:
+  """Recursively find image files under `root`, skipping hidden and model-weight dirs."""
   db_resolved = db_path.resolve()
+  excluded = {Path(d).resolve() for d in (exclude_dirs or [])}
   found: list[Path] = []
   for dirpath, dirnames, filenames in os.walk(root):
-    dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+    cur = Path(dirpath)
+    pruned_dirs: list[str] = []
+    for d in sorted(dirnames):
+      if d.startswith("."):
+        continue
+      sub = (cur / d).resolve()
+      if sub in excluded:
+        continue
+      # Skip downloaded Hugging Face weight directories even if custom-named
+      if (sub / "sentence_bert_config.json").is_file() or (sub / "model.safetensors").is_file():
+        continue
+      pruned_dirs.append(d)
+    dirnames[:] = pruned_dirs
+
     for fname in sorted(filenames):
       if fname.startswith("."):
         continue
-      p = Path(dirpath) / fname
+      p = cur / fname
       if p.suffix.lower() not in IMAGE_EXTENSIONS:
         continue
       if p.resolve() == db_resolved:
@@ -414,7 +178,7 @@ def format_duration(seconds: float) -> str:
 def build_index(
     root: Path,
     db_path: Path,
-    client: EmbeddingClient,
+    client: EmbeddingBackend,
     batch_size: int = DEFAULT_BATCH_SIZE,
     force: bool = False,
     retry_errors: bool = False,
@@ -429,13 +193,21 @@ def build_index(
   served_model = client.verify()
   conn = open_db(db_path)
   try:
+    existing_model = get_meta(conn, "model_id")
+    if not force and existing_model and models_compatible(existing_model, client.model_id):
+      client.model_id = existing_model
+    endpoint_label = getattr(client, "base_url", "local")
     with conn:
       set_meta(conn, "root_dir", str(root))
       set_meta(conn, "model_id", client.model_id)
       set_meta(conn, "served_model", served_model)
-      set_meta(conn, "endpoint", client.base_url)
+      set_meta(conn, "endpoint", endpoint_label)
 
-    files = discover_images(root, db_path)
+    exclude_dirs = [DEFAULT_MODELS_BASE]
+    wdir = getattr(client, "weights_dir", None)
+    if wdir is not None:
+      exclude_dirs.append(Path(wdir))
+    files = discover_images(root, db_path, exclude_dirs=exclude_dirs)
     existing_rows = {row["path"]: row for row in conn.execute("SELECT * FROM images").fetchall()}
     # Cache known vectors by sha256 for the active model so duplicates/moves don't re-embed
     hash_vectors: dict[str, tuple[int, bytes]] = {}
@@ -816,10 +588,33 @@ def rank_vectors(
   return results
 
 
+def _resolve_search_model(conn: sqlite3.Connection, client: EmbeddingBackend) -> str:
+  """Align `client` with the index's `model_id` and return the SQLite `model_id` filter key."""
+  db_model = get_meta(conn, "model_id")
+  if getattr(client, "is_local", False):
+    if not client._explicit_model and db_model:
+      client.hf_model_id = resolve_local_hf_model(db_model)
+      client.served_model = client.hf_model_id
+      client.model_id = db_model
+    elif db_model and not models_compatible(db_model, client.hf_model_id):
+      raise ModelMismatch(
+          f"index uses {db_model!r}, which does not match local model {client.hf_model_id!r}"
+      )
+    return db_model or client.model_id or resolve_local_hf_model(None)
+
+  if client.model_id is None:
+    client.model_id = db_model
+  if client.model_id is None:
+    client.verify()
+  if db_model and models_compatible(db_model, client.model_id):
+    return db_model
+  return client.model_id
+
+
 def search_text(
     query: str,
     db_path: Path,
-    client: EmbeddingClient,
+    client: EmbeddingBackend,
     limit: int = 10,
     min_score: float = 0.0,
     folder: str | None = None,
@@ -832,11 +627,7 @@ def search_text(
     )
   conn = open_db(db_path, readonly=True)
   try:
-    if client.model_id is None:
-      client.model_id = get_meta(conn, "model_id")
-    if client.model_id is None:
-      client.verify()
-    model_id = client.model_id
+    model_id = _resolve_search_model(conn, client)
     root_dir, records, matrix = load_resident_index(conn, model_id=model_id, folder=folder)
   finally:
     conn.close()
@@ -857,7 +648,7 @@ def search_text(
 def search_similar(
     target_image: Path,
     db_path: Path,
-    client: EmbeddingClient,
+    client: EmbeddingBackend,
     limit: int = 10,
     min_score: float = 0.0,
     folder: str | None = None,
@@ -875,11 +666,7 @@ def search_similar(
 
   conn = open_db(db_path, readonly=True)
   try:
-    if client.model_id is None:
-      client.model_id = get_meta(conn, "model_id")
-    if client.model_id is None:
-      client.verify()
-    model_id = client.model_id
+    model_id = _resolve_search_model(conn, client)
     root_dir, records, matrix = load_resident_index(conn, model_id=model_id, folder=folder)
 
     exclude_rel: str | None = None
@@ -916,17 +703,21 @@ def search_similar(
   )
 
 
-def get_status(db_path: Path, client: EmbeddingClient) -> dict:
+def get_status(db_path: Path, client: EmbeddingBackend) -> dict:
   probe_info = client.probe()
+  endpoint_desc = getattr(client, "base_url", f"local ({getattr(client, 'hf_model_id', '')})")
   info: dict = {
       "db_path": str(db_path),
       "db_exists": db_path.exists(),
-      "endpoint": client.base_url,
+      "endpoint": endpoint_desc,
       "endpoint_reachable": probe_info["reachable"],
       "served_model": probe_info["served_model"],
       "embedding_models": probe_info["embedding_models"],
       "available_models": probe_info["available_models"],
   }
+  if "weights_dir" in probe_info:
+    info["weights_dir"] = probe_info["weights_dir"]
+    info["weights_downloaded"] = probe_info["weights_downloaded"]
   if not db_path.exists():
     return info
 
@@ -1198,17 +989,29 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
   p.add_argument(
       "--db", type=Path, default=DEFAULT_DB, help=f"SQLite index path (default: {DEFAULT_DB})"
   )
-  p.add_argument(
-      "--endpoint",
-      default=DEFAULT_ENDPOINT,
-      help=f"Embedding server URL (default: {DEFAULT_ENDPOINT})",
+  endpoint_help = (
+      f"Embedding server URL (default: {DEFAULT_ENDPOINT})"
+      if DEFAULT_ENDPOINT
+      else "Embedding server URL (if omitted, runs model locally in-process)"
   )
+  p.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help=endpoint_help)
   model_help = (
-      f"Model ID substring (default: {DEFAULT_MODEL})"
+      f"Model ID substring or HF repo (default: {DEFAULT_MODEL})"
       if DEFAULT_MODEL
-      else "Model ID substring (default: first embedding model reported by endpoint)"
+      else "Model ID substring or HF repo (default: auto-detected / google/embeddinggemma-2)"
   )
   p.add_argument("--model", default=DEFAULT_MODEL, help=model_help)
+  model_dir_help = (
+      f"Directory to download/load local model weights (default: {DEFAULT_MODEL_DIR})"
+      if DEFAULT_MODEL_DIR
+      else "Directory to download/load local model weights (default: ./models/<model>)"
+  )
+  p.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help=model_dir_help)
+  p.add_argument(
+      "--device",
+      default=DEFAULT_DEVICE,
+      help="Torch device when running locally (e.g. cpu, cuda; default: auto)",
+  )
 
 
 def _add_search_output_flags(p: argparse.ArgumentParser) -> None:
@@ -1313,6 +1116,18 @@ def _normalize_argv(raw_args: list[str]) -> list[str]:
   return expanded
 
 
+def create_backend(args: argparse.Namespace) -> EmbeddingBackend:
+  if args.endpoint:
+    return EmbeddingClient(base_url=args.endpoint, model_id=args.model)
+  mode = "vision" if args.command in ("index", "similar") else "text"
+  return LocalEmbeddingClient(
+      model_id=args.model,
+      model_dir=args.model_dir,
+      mode=mode,
+      device=args.device,
+  )
+
+
 def main(argv: list[str] | None = None) -> int:
   raw_args = _normalize_argv(list(sys.argv[1:] if argv is None else argv))
 
@@ -1320,7 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
   args = parser.parse_args(raw_args)
 
   try:
-    with EmbeddingClient(base_url=args.endpoint, model_id=args.model) as client:
+    with create_backend(args) as client:
       if args.command == "index":
         if args.batch_size < 1:
           parser.error("--batch-size must be >= 1")
@@ -1391,15 +1206,18 @@ def main(argv: list[str] | None = None) -> int:
                 f"({info['unique_hashes']} unique hashes, {info['errors']} errors)"
             )
             print(f"DB size:        {size_mb:.2f} MB")
+          if "weights_dir" in info:
+            dl_state = "downloaded" if info["weights_downloaded"] else "not downloaded yet"
+            print(f"Weights dir:    {info['weights_dir']} ({dl_state})")
           if not info["endpoint_reachable"]:
-            endpoint_state = "UNREACHABLE"
+            endpoint_state = "UNAVAILABLE"
           elif info["served_model"]:
-            endpoint_state = f"reachable (embedding model: {info['served_model']!r})"
+            endpoint_state = f"ready (model: {info['served_model']!r})"
           else:
             endpoint_state = (
                 f"reachable (no embedding model detected; available: {info['available_models']})"
             )
-          print(f"Endpoint:       {info['endpoint']} — {endpoint_state}")
+          print(f"Backend:        {info['endpoint']} — {endpoint_state}")
         return 0
   except BrokenPipeError:
     devnull = os.open(os.devnull, os.O_WRONLY)
