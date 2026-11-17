@@ -1,0 +1,22 @@
+[project]
+name = "imgsearch"
+version = "0.1.0"
+description = "Vector indexer and semantic search CLI for images using EmbeddingGemma 2"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx",
+    "numpy",
+    "pillow",
+]
+
+[project.scripts]
+imgsearch = "imgsearch:main"
+
+[tool.pyink]
+pyink = true
+pyink-indentation = 2
+line-length = 100
+target-version = ["py311"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
