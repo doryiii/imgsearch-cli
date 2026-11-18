@@ -1,7 +1,8 @@
-"""Shared types, constants, and utilities for remote and local embedding backends."""
+"""Shared types and helpers for remote and local embedding backends."""
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from typing import Protocol
 
@@ -9,6 +10,7 @@ import numpy as np
 
 QUERY_PREFIX = "task: search result | query: "
 DEFAULT_HF_MODEL = "google/embeddinggemma-2"
+CANONICAL_GEMMA2_ID = "embeddinggemma-2"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 EXT_MIMES = {
@@ -26,7 +28,7 @@ class EmbedError(Exception):
 
 
 class EndpointUnreachable(EmbedError):
-  """Connection error, timeout, 5xx, or malformed response."""
+  """Connection error, timeout, 5xx, or systemic server failure."""
 
 
 class ModelMismatch(EmbedError):
@@ -38,7 +40,7 @@ class ItemRejected(EmbedError):
 
 
 class EmbeddingBackend(Protocol):
-  """Common interface implemented by both remote HTTP and local CPU/GPU backends."""
+  """Interface implemented by remote HTTP and local CPU/GPU backends."""
 
   model_id: str | None
   served_model: str | None
@@ -60,7 +62,7 @@ class EmbeddingBackend(Protocol):
 
 
 def detect_mime(data: bytes, path: Path | None = None) -> str:
-  """Detect image MIME type from magic bytes with file-extension fallback."""
+  """Detect image MIME type from magic bytes with extension fallback."""
   if data.startswith(b"\x89PNG\r\n\x1a\n"):
     return "image/png"
   if data.startswith(b"\xff\xd8\xff"):
@@ -77,36 +79,85 @@ def detect_mime(data: bytes, path: Path | None = None) -> str:
 
 
 def normalize(vector) -> np.ndarray:
-  """Defensive L2 normalization to float32."""
+  """Defensive L2 normalization to float32, rejecting NaN/Inf values."""
   arr = np.asarray(vector, dtype=np.float32)
+  if arr.ndim != 1 or arr.size == 0 or not np.all(np.isfinite(arr)):
+    raise EmbedError("invalid embedding vector (empty, NaN, or Inf)")
   norm = float(np.linalg.norm(arr))
   return arr / norm if norm > 0 else arr
 
 
 def is_embeddinggemma2(model_id: str | None) -> bool:
-  """Return True if `model_id` refers to EmbeddingGemma 2 under HF or GGUF/llama.cpp naming."""
+  """Return True if `model_id` names EmbeddingGemma 2 (HF or GGUF)."""
   if not model_id:
     return False
   low = model_id.lower()
-  return any(tok in low for tok in ("embeddinggemma-2", "embeddinggemma2", "embedding_gemma2"))
+  tokens = ("embeddinggemma-2", "embeddinggemma2", "embedding_gemma2")
+  return any(tok in low for tok in tokens)
+
+
+def canonical_model_id(model_id: str | None) -> str | None:
+  """Normalize EmbeddingGemma 2 aliases to a single canonical model key."""
+  if not model_id:
+    return None
+  stripped = model_id.strip()
+  if not stripped:
+    return None
+  if is_embeddinggemma2(stripped):
+    return CANONICAL_GEMMA2_ID
+  return stripped
 
 
 def models_compatible(a: str | None, b: str | None) -> bool:
-  """Return True when two model identifiers share the same embedding vector space."""
+  """Return True when two model identifiers share the same vector space."""
   if not a or not b:
     return False
-  la, lb = a.lower(), b.lower()
-  if la == lb or la in lb or lb in la:
+  if is_embeddinggemma2(a) or is_embeddinggemma2(b):
+    return is_embeddinggemma2(a) and is_embeddinggemma2(b)
+  la = a.strip().lower()
+  lb = b.strip().lower()
+  if not la or not lb:
+    return False
+  if la == lb:
     return True
-  return is_embeddinggemma2(a) and is_embeddinggemma2(b)
+  base_a = la.rsplit("/", 1)[-1]
+  base_b = lb.rsplit("/", 1)[-1]
+  return bool(base_a) and base_a == base_b
 
 
 def resolve_local_hf_model(model_id: str | None) -> str:
-  """Map a CLI/DB model identifier to a Hugging Face repo ID or local directory path."""
-  if not model_id:
+  """Map a CLI/DB model identifier to an HF repo ID or local directory."""
+  if not model_id or not model_id.strip():
     return DEFAULT_HF_MODEL
-  if Path(model_id).exists() or "/" in model_id:
-    return model_id
-  if is_embeddinggemma2(model_id):
-    return DEFAULT_HF_MODEL
-  return model_id
+  cleaned = model_id.strip()
+  if Path(cleaned).is_dir():
+    return cleaned
+  low = cleaned.lower()
+  if is_embeddinggemma2(cleaned):
+    if "/" not in cleaned or "gguf" in low:
+      return DEFAULT_HF_MODEL
+    return cleaned
+  return cleaned
+
+
+def decode_rgb_image(source: bytes | Path):
+  """Decode image bytes or path to RGB, compositing alpha onto dark gray."""
+  try:
+    from PIL import Image, ImageOps
+  except ImportError as exc:
+    raise EmbedError(
+        "Pillow is required for image decoding (`pip install pillow`)"
+    ) from exc
+
+  stream = io.BytesIO(source) if isinstance(source, bytes) else source
+  try:
+    with Image.open(stream) as im:
+      im = ImageOps.exif_transpose(im)
+      has_alpha = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+      if has_alpha:
+        rgba = im.convert("RGBA")
+        bg = Image.new("RGBA", rgba.size, (30, 30, 30, 255))
+        return Image.alpha_composite(bg, rgba).convert("RGB")
+      return im.convert("RGB")
+  except Image.DecompressionBombError as exc:
+    raise ValueError(f"image exceeds decompression limit: {exc}") from exc

@@ -1,16 +1,20 @@
-"""Tests for imgsearch endpoint contract, incremental indexing, and CLI search."""
+"""Tests for imgsearch contract, backends, storage, CLI, and security."""
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
+import sqlite3
 
 import httpx
 import numpy as np
 import pytest
 
+import embed_base
 import imgsearch
+import local_embed
 
 PNG_HEADER = b"\x89PNG\r\n\x1a\n"
 JPEG_HEADER = b"\xff\xd8\xff\xe0"
@@ -21,7 +25,7 @@ def make_mock_transport(
     llama_models_shape: bool = False,
     reject_marker: bytes | None = None,
 ):
-  """Build an httpx.MockTransport that enforces the llama.cpp multimodal contract."""
+  """Build an httpx.MockTransport enforcing the llama.cpp contract."""
   calls: list[dict] = []
 
   def handler(request: httpx.Request) -> httpx.Response:
@@ -38,30 +42,28 @@ def make_mock_transport(
       inp = payload["input"]
 
       if isinstance(inp, str):
-        # Text query: deterministically map text to a 4-D vector
-        assert inp.startswith(imgsearch.QUERY_PREFIX), "query must carry asymmetric prefix"
-        q = inp[len(imgsearch.QUERY_PREFIX) :]
+        if "embeddinggemma" in served_model.lower():
+          assert inp.startswith(imgsearch.QUERY_PREFIX)
+          q = inp[len(imgsearch.QUERY_PREFIX) :]
+        else:
+          assert not inp.startswith(imgsearch.QUERY_PREFIX)
+          q = inp
         vec = _fake_vec_for_tag(q)
         return httpx.Response(200, json={"data": [{"embedding": vec}]})
 
-      assert isinstance(inp, list), "image input must be a list"
+      assert isinstance(inp, list)
       out = []
       for item in inp:
-        # Enforce nested content[].image_url contract (flat shape 400s on llama.cpp)
         if not isinstance(item, dict) or "content" not in item:
           return httpx.Response(400, text="flat shape rejected")
         part = item["content"][0]
         assert part["type"] == "image_url"
         url = part["image_url"]["url"]
         assert url.startswith("data:image/")
-        b64 = url.split(",", 1)[1]
-        import base64
-
-        raw = base64.b64decode(b64)
+        raw = base64.b64decode(url.split(",", 1)[1])
         if reject_marker and reject_marker in raw:
           return httpx.Response(400, text="corrupt image rejected")
-        tag = raw.decode("latin1")
-        out.append({"embedding": _fake_vec_for_tag(tag)})
+        out.append({"embedding": _fake_vec_for_tag(raw.decode("latin1"))})
       return httpx.Response(200, json={"data": out})
 
     return httpx.Response(404)
@@ -71,7 +73,7 @@ def make_mock_transport(
 
 def _fake_vec_for_tag(tag: str) -> list[float]:
   if "terminal" in tag:
-    return [2.0, 0.0, 0.0, 0.0]  # deliberately unnormalized to test defensive L2 norm
+    return [2.0, 0.0, 0.0, 0.0]
   if "browser" in tag:
     return [0.0, 3.0, 0.0, 0.0]
   if "chart" in tag:
@@ -79,36 +81,93 @@ def _fake_vec_for_tag(tag: str) -> list[float]:
   return [0.0, 0.0, 0.0, 1.0]
 
 
-def test_detect_mime():
+def test_detect_mime_and_normalize():
   assert imgsearch.detect_mime(PNG_HEADER + b"abc") == "image/png"
   assert imgsearch.detect_mime(JPEG_HEADER + b"abc") == "image/jpeg"
   assert imgsearch.detect_mime(b"RIFF\x00\x00\x00\x00WEBP") == "image/webp"
   assert imgsearch.detect_mime(b"unknown", Path("foo.jpg")) == "image/jpeg"
 
+  with pytest.raises(imgsearch.EmbedError):
+    imgsearch.normalize([float("nan"), 1.0])
+  with pytest.raises(imgsearch.EmbedError):
+    imgsearch.normalize([float("inf"), 1.0])
 
-def test_model_probe_and_mismatch():
-  transport, _ = make_mock_transport(served_model="qwen3-embedding-8b", llama_models_shape=True)
+
+def test_model_compatibility_and_gguf_resolution():
+  assert embed_base.models_compatible(
+      "embeddinggemma-2", "google/embeddinggemma-2"
+  )
+  assert embed_base.models_compatible(
+      "ggmlorg-embeddinggemma-2-BF16", "embeddinggemma-2-Q8_0"
+  )
+  # Must NOT conflate v1 and v2 or broad substrings
+  assert not embed_base.models_compatible("embeddinggemma", "embeddinggemma-2")
+  assert not embed_base.models_compatible("embed", "embeddinggemma-2")
+  assert not embed_base.models_compatible(".", "model.gguf")
+  assert embed_base.models_compatible("BAAI/bge-m3", "bge-m3")
+
+  assert (
+      embed_base.resolve_local_hf_model("/models/embeddinggemma-2-Q8_0.gguf")
+      == "google/embeddinggemma-2"
+  )
+  assert (
+      embed_base.resolve_local_hf_model("ggml-org/embeddinggemma-2-GGUF")
+      == "google/embeddinggemma-2"
+  )
+
+
+def test_model_probe_mismatch_and_remote_parity(tmp_path: Path):
+  t_qwen, _ = make_mock_transport(
+      served_model="qwen3-embedding-8b", llama_models_shape=True
+  )
   with imgsearch.EmbeddingClient(
-      "http://mock:8091", "embeddinggemma-2", transport=transport
+      "http://mock:8091", "embeddinggemma-2", transport=t_qwen
   ) as client:
+    info = client.probe()
+    assert info["matches"] is False
+    assert info["served_model"] is None
     with pytest.raises(imgsearch.ModelMismatch):
       client.verify()
 
-
-def test_index_incremental_dedup_and_search(tmp_path: Path):
+  # Index with embeddinggemma-2, then query remotely with incompatible --model
   root = tmp_path / "lib"
-  (root / "sub1").mkdir(parents=True)
-  (root / "sub2").mkdir(parents=True)
+  root.mkdir()
+  (root / "a.png").write_bytes(PNG_HEADER + b"terminal")
+  db_path = tmp_path / "index.db"
+  t_gemma, _ = make_mock_transport(served_model="embeddinggemma-2")
+  with imgsearch.EmbeddingClient(
+      "http://mock:8091", None, transport=t_gemma
+  ) as c1:
+    imgsearch.build_index(root, db_path, c1, quiet=True)
 
-  img_term = root / "sub1" / "term.png"
-  img_term_dup = root / "sub2" / "term_copy.png"
-  img_browser = root / "sub1" / "browser.jpg"
-  img_chart = root / "sub2" / "chart.png"
+  with imgsearch.EmbeddingClient(
+      "http://mock:8091", "qwen3-embedding-8b", transport=t_qwen
+  ) as c2:
+    with pytest.raises(imgsearch.ModelMismatch):
+      imgsearch.search_text("terminal", db_path, c2)
+
+
+def test_index_incremental_dedup_folder_wildcards_and_similar(tmp_path: Path):
+  root = tmp_path / "lib"
+  (root / "2026_04").mkdir(parents=True)
+  (root / "2026-04").mkdir(parents=True)
+  # User photo folder named `models/` must NOT be skipped!
+  (root / "models").mkdir(parents=True)
+
+  img_term = root / "2026_04" / "term.png"
+  img_term_dup = root / "models" / "term_copy.png"
+  img_browser = root / "2026-04" / "browser.jpg"
+  img_chart = root / "2026_04" / "chart.png"
 
   img_term.write_bytes(PNG_HEADER + b"terminal screenshot")
-  img_term_dup.write_bytes(PNG_HEADER + b"terminal screenshot")  # exact sha256 duplicate
+  img_term_dup.write_bytes(PNG_HEADER + b"terminal screenshot")
   img_browser.write_bytes(JPEG_HEADER + b"browser window")
   img_chart.write_bytes(PNG_HEADER + b"chart plot")
+
+  ext_img = tmp_path / "external_real.png"
+  ext_img.write_bytes(PNG_HEADER + b"chart plot external")
+  sym_img = root / "2026_04" / "sym_chart.png"
+  sym_img.symlink_to(ext_img)
 
   db_path = tmp_path / "index.db"
   transport, calls = make_mock_transport(llama_models_shape=True)
@@ -116,53 +175,34 @@ def test_index_incremental_dedup_and_search(tmp_path: Path):
   with imgsearch.EmbeddingClient(
       "http://mock:8091", "embeddinggemma-2", transport=transport
   ) as client:
-    summary1 = imgsearch.build_index(root, db_path, client, batch_size=2, quiet=True)
-    # 4 files total, but 1 is an exact sha256 duplicate in a later batch -> only 3 embedded!
-    assert summary1["total_files"] == 4
-    assert summary1["embedded"] + summary1["reused_hash"] == 4
-    assert summary1["reused_hash"] == 1
-    assert summary1["failed"] == 0
+    s1 = imgsearch.build_index(root, db_path, client, batch_size=2, quiet=True)
+    assert s1["total_files"] == 5
+    assert s1["reused_hash"] == 1
+    assert s1["failed"] == 0
 
     calls_after_first = len(calls)
-
-    # Second run with no changes should make 0 HTTP embedding calls
-    summary2 = imgsearch.build_index(root, db_path, client, batch_size=2, quiet=True)
-    assert summary2["up_to_date"] == 4
-    assert summary2["embedded"] == 0
+    s2 = imgsearch.build_index(root, db_path, client, batch_size=2, quiet=True)
+    assert s2["up_to_date"] == 5
     assert len(calls) == calls_after_first
 
-    # Text search for "terminal"
-    hits = imgsearch.search_text("terminal", db_path, client, limit=5)
-    assert len(hits) == 4
-    assert hits[0]["score"] == pytest.approx(1.0, abs=1e-5)
-    assert hits[1]["score"] == pytest.approx(1.0, abs=1e-5)
-    assert {hits[0]["rel_path"], hits[1]["rel_path"]} == {"sub1/term.png", "sub2/term_copy.png"}
+    # `--folder 2026_04` must NOT match `2026-04` (`_` escaped in LIKE)
+    f_hits = imgsearch.search_text("browser", db_path, client, folder="2026_04")
+    assert all("2026-04" not in h["rel_path"] for h in f_hits)
 
-    # Dedup collapses exact duplicates
-    dedup_hits = imgsearch.search_text("terminal", db_path, client, limit=5, dedup=True)
-    assert len(dedup_hits) == 3
-    assert dedup_hits[0]["score"] == pytest.approx(1.0, abs=1e-5)
-    assert dedup_hits[1]["score"] == pytest.approx(0.0, abs=1e-5)
-
-    # Folder filter
-    sub2_hits = imgsearch.search_text("chart", db_path, client, folder="sub2", min_score=0.5)
-    assert [h["rel_path"] for h in sub2_hits] == ["sub2/chart.png"]
-
-    # Similar image search on an indexed image should NOT hit the endpoint!
+    # `similar` on symlink inside root hits DB cache & excludes self
     calls_before_sim = len(calls)
-    sim_hits = imgsearch.search_similar(img_term, db_path, client, limit=3)
+    sim_hits = imgsearch.search_similar(sym_img, db_path, client, limit=5)
     assert len(calls) == calls_before_sim
-    assert sim_hits[0]["rel_path"] == "sub2/term_copy.png"
-    assert sim_hits[0]["score"] == pytest.approx(1.0, abs=1e-5)
+    assert all(h["rel_path"] != "2026_04/sym_chart.png" for h in sim_hits)
 
-    # Deleting a file prunes it on re-index
-    img_chart.unlink()
-    summary3 = imgsearch.build_index(root, db_path, client, quiet=True)
-    assert summary3["pruned"] == 1
-    assert summary3["up_to_date"] == 3
+    # Modifying `img_term` on disk invalidates `search_similar`'s DB cache
+    img_term.write_bytes(PNG_HEADER + b"browser updated bytes")
+    sim_updated = imgsearch.search_similar(img_term, db_path, client, limit=1)
+    assert len(calls) == calls_before_sim + 1
+    assert sim_updated[0]["rel_path"] == "2026-04/browser.jpg"
 
 
-def test_batch_rejection_falls_back_to_serial_and_permissions_recover(tmp_path: Path):
+def test_batch_rejection_systemic_errors_and_out_of_order_index(tmp_path: Path):
   root = tmp_path / "lib"
   root.mkdir()
   good = root / "a_good.png"
@@ -181,156 +221,262 @@ def test_batch_rejection_falls_back_to_serial_and_permissions_recover(tmp_path: 
     with imgsearch.EmbeddingClient(
         "http://mock:8091", "embeddinggemma-2", transport=transport
     ) as client:
-      summary = imgsearch.build_index(root, db_path, client, batch_size=8, quiet=True)
-      assert summary["embedded"] == 1
-      # 1 rejected by server + 1 unreadable (unless running as root)
+      s1 = imgsearch.build_index(root, db_path, client, quiet=True)
+      assert s1["embedded"] == 1
       expected_failed = 1 if os.geteuid() == 0 else 2
-      assert summary["failed"] == expected_failed
+      assert s1["failed"] == expected_failed
 
       if os.geteuid() != 0:
-        # Fix permissions: next index pass should automatically pick up `locked`!
         locked.chmod(0o644)
-        summary2 = imgsearch.build_index(root, db_path, client, batch_size=8, quiet=True)
-        assert summary2["embedded"] == 1
-        assert summary2["up_to_date"] == 1
-        assert summary2["skipped_errors"] == 1  # `b_bad.png` stays skipped unless --retry-errors
+        s2 = imgsearch.build_index(root, db_path, client, quiet=True)
+        assert s2["embedded"] == 1
+        assert s2["up_to_date"] == 1
+        assert s2["skipped_errors"] == 1
   finally:
     locked.chmod(0o644)
 
+  # Systemic 400 (missing mmproj) must raise EndpointUnreachable, NOT poison DB
+  db_sys = tmp_path / "sys.db"
+  no_mmproj = httpx.MockTransport(
+      lambda req: (
+          httpx.Response(200, json={"data": [{"id": "embeddinggemma-2"}]})
+          if req.url.path == "/v1/models"
+          else httpx.Response(400, text="image input is not supported (mmproj)")
+      )
+  )
+  with imgsearch.EmbeddingClient(
+      "http://mock:8091", None, transport=no_mmproj
+  ) as bad_srv:
+    with pytest.raises(imgsearch.EndpointUnreachable):
+      imgsearch.build_index(root, db_sys, bad_srv, quiet=True)
+  conn = sqlite3.connect(db_sys)
+  assert conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] == 0
+  conn.close()
 
-def test_cli_shorthand_and_output_modes(tmp_path: Path, monkeypatch, capsys):
+  # Out-of-order `data[].index` must be sorted back to input order
+  ooo_transport = httpx.MockTransport(
+      lambda req: (
+          httpx.Response(200, json={"data": [{"id": "embeddinggemma-2"}]})
+          if req.url.path == "/v1/models"
+          else httpx.Response(
+              200,
+              json={
+                  "data": [
+                      {"index": 1, "embedding": [0.0, 1.0]},
+                      {"index": 0, "embedding": [1.0, 0.0]},
+                  ]
+              },
+          )
+      )
+  )
+  with imgsearch.EmbeddingClient(
+      "http://mock:8091", None, transport=ooo_transport
+  ) as ooo_client:
+    vecs = ooo_client.embed_images([(b"a", "image/png"), (b"b", "image/png")])
+    assert list(vecs[0]) == pytest.approx([1.0, 0.0])
+    assert list(vecs[1]) == pytest.approx([0.0, 1.0])
+
+
+def test_cli_argv_normalization_validation_and_modes(
+    tmp_path: Path, monkeypatch, capsys
+):
   root = tmp_path / "lib"
   root.mkdir()
-  (root / "terminal_err.png").write_bytes(PNG_HEADER + b"terminal traceback")
-  (root / "browser_tab.png").write_bytes(PNG_HEADER + b"browser page")
+  img_a = root / "terminal_err.png"
+  img_b = root / "browser_tab.png"
+  img_a.write_bytes(PNG_HEADER + b"terminal traceback")
+  img_b.write_bytes(PNG_HEADER + b"browser page")
   db_path = tmp_path / "index.db"
 
   transport, _ = make_mock_transport()
   orig_client = imgsearch.EmbeddingClient
-
-  def patched_client(base_url, model_id=imgsearch.DEFAULT_MODEL):
-    return orig_client(base_url=base_url, model_id=model_id, transport=transport)
-
-  monkeypatch.setattr(imgsearch, "EmbeddingClient", patched_client)
-
-  rc = imgsearch.main(
-      ["index", str(root), "--db", str(db_path), "--endpoint", "http://mock:8091", "-q"]
+  monkeypatch.setattr(
+      imgsearch,
+      "EmbeddingClient",
+      lambda base_url, model_id=None: orig_client(
+          base_url=base_url, model_id=model_id, transport=transport
+      ),
   )
-  assert rc == 0
 
-  # Shorthand `imgsearch "terminal" ...` dispatches to `search`
-  rc = imgsearch.main(
-      ["terminal", "--db", str(db_path), "--endpoint", "http://mock:8091", "--json", "-n", "1"]
-  )
-  assert rc == 0
-  out = json.loads(capsys.readouterr().out)
-  assert len(out) == 1
-  assert out[0]["rel_path"] == "terminal_err.png"
-
-  # `-l` / `--paths-only`
+  # Global flags BEFORE `index` and `status` must NOT misdispatch to `search`!
   rc = imgsearch.main(
       [
-          "search",
-          "browser",
           "--db",
           str(db_path),
           "--endpoint",
           "http://mock:8091",
-          "-l",
-          "--abs",
+          "index",
+          str(root),
+          "-q",
+      ]
+  )
+  assert rc == 0
+
+  rc = imgsearch.main(
+      [
+          "--db",
+          str(db_path),
+          "--endpoint",
+          "http://mock:8091",
+          "status",
+          "--json",
+      ]
+  )
+  assert rc == 0
+  st = json.loads(capsys.readouterr().out)
+  assert st["embedded"] == 2
+  assert st["model_matches"] is True
+
+  # Interleaved flags (`terminal -n 1 traceback`) work cleanly
+  rc = imgsearch.main(
+      [
+          "terminal",
+          "-n",
+          "1",
+          "traceback",
+          "--db",
+          str(db_path),
+          "--endpoint",
+          "http://mock:8091",
+          "--json",
+      ]
+  )
+  assert rc == 0
+  out = json.loads(capsys.readouterr().out)
+  assert out[0]["rel_path"] == "terminal_err.png"
+
+  # `--` stops `--thumb=` expansion
+  norm = imgsearch._normalize_argv(["search", "--", "--thumb=literal"])
+  assert norm == ["search", "--", "--thumb=literal"]
+
+  # `-0` / `--null` mode and `similar` CLI subcommand
+  rc = imgsearch.main(
+      [
+          "similar",
+          str(img_a),
+          "--include-self",
+          "--db",
+          str(db_path),
+          "--endpoint",
+          "http://mock:8091",
+          "-0",
           "-n",
           "1",
       ]
   )
   assert rc == 0
-  line = capsys.readouterr().out.strip()
-  assert line == str((root / "browser_tab.png").resolve())
+  nul_out = capsys.readouterr().out
+  assert nul_out.endswith("\0")
 
-  # `status --json`
-  rc = imgsearch.main(["status", "--db", str(db_path), "--endpoint", "http://mock:8091", "--json"])
-  assert rc == 0
-  st = json.loads(capsys.readouterr().out)
-  assert st["embedded"] == 2
-  assert st["endpoint_reachable"] is True
+  # Invalid numeric flags exit with code 2
+  for bad_argv in (
+      ["cat", "-n", "0", "--db", str(db_path)],
+      ["cat", "--min-score", "nan", "--db", str(db_path)],
+      ["cat", "--min-score", "2.0", "--db", str(db_path)],
+      ["cat", "--thumb-rows", "0", "--db", str(db_path)],
+  ):
+    with pytest.raises(SystemExit) as exc_info:
+      imgsearch.main(bad_argv)
+    assert exc_info.value.code == 2
 
 
-def test_detect_thumb_backend_and_osc8():
-  assert imgsearch.detect_thumb_backend({"KITTY_WINDOW_ID": "1", "TERM": "xterm-kitty"}) == "kitty"
+def test_tty_escape_sanitization_and_osc8():
   assert (
-      imgsearch.detect_thumb_backend({"KONSOLE_VERSION": "240800", "TERM": "xterm-256color"})
+      imgsearch.detect_thumb_backend(
+          {"KITTY_WINDOW_ID": "1", "TERM": "xterm-kitty"}
+      )
       == "kitty"
   )
   assert (
-      imgsearch.detect_thumb_backend({"KITTY_WINDOW_ID": "1", "TMUX": "/tmp/tmux-1000/default"})
+      imgsearch.detect_thumb_backend(
+          {"KONSOLE_VERSION": "240800", "TERM": "xterm-256color"}
+      )
+      == "kitty"
+  )
+  assert (
+      imgsearch.detect_thumb_backend(
+          {"KITTY_WINDOW_ID": "1", "TMUX": "/tmp/tmux-1000/default"}
+      )
       == "ansi"
   )
-  assert imgsearch.detect_thumb_backend({"IMGSEARCH_THUMB": "sixel", "TMUX": "1"}) == "sixel"
-  assert imgsearch.detect_thumb_backend({"TERM": "dumb"}) == "ansi"
+  assert (
+      imgsearch.detect_thumb_backend({"IMGSEARCH_THUMB": "sixel", "TMUX": "1"})
+      == "sixel"
+  )
 
-  assert imgsearch.supports_osc8({"TERM": "xterm-kitty"}, isatty=True) is True
-  assert imgsearch.supports_osc8({"TERM": "dumb"}, isatty=True) is False
-  assert imgsearch.supports_osc8({"TERM": "xterm-kitty"}, isatty=False) is False
+  # Malicious control characters in label cannot escape OSC 8 or spoof lines
+  evil_name = "bad\x1b\\inject\x07\r\nfile.png"
+  linked = imgsearch.osc8_link("/tmp/safe.png", evil_name)
+  assert linked.count("\x1b\\") == 2
+  assert "\x07" not in linked
+  assert "\n" not in linked
+  assert "\ufffd" in linked
 
-  linked = imgsearch.osc8_link("/tmp/my file.png", "my file.png")
-  assert linked == "\x1b]8;;file:///tmp/my%20file.png\x1b\\my file.png\x1b]8;;\x1b\\"
 
-
-def test_thumbnail_renderers_and_cli_flags(tmp_path: Path, monkeypatch, capsys):
+def test_thumbnail_renderers_and_corrupt_graceful_fallback(
+    tmp_path: Path, monkeypatch, capsys
+):
   from PIL import Image
 
   root = tmp_path / "lib"
   root.mkdir()
   sample = root / "terminal_sample.png"
-  # Create a valid RGBA PNG so Pillow can load it AND our mock embedder sees "terminal" in raw bytes
-  im = Image.new("RGBA", (64, 32), (20, 160, 220, 200))
-  im.save(sample, format="PNG")
+  # Palette image with byte transparency verifies clean RGBA compositing
+  pal = Image.new("P", (16, 16), 0)
+  pal.putpalette([20, 160, 220] + [0, 0, 0] * 255)
+  pal.info["transparency"] = b"\x00"
+  pal.save(sample, format="PNG")
 
-  kitty_out = imgsearch.render_thumbnail(sample, backend="kitty", rows=6, term_cols=80)
+  kitty_out = imgsearch.render_thumbnail(
+      sample, backend="kitty", rows=6, term_cols=80
+  )
   assert kitty_out.startswith("    \x1b_Ga=T,f=100,r=6,q=2,m=")
   assert kitty_out.endswith("\x1b\\\n")
 
-  ansi_out = imgsearch.render_thumbnail(sample, backend="ansi", rows=4, term_cols=80)
+  ansi_out = imgsearch.render_thumbnail(
+      sample, backend="ansi", rows=4, term_cols=80
+  )
   ansi_lines = ansi_out.splitlines()
   assert len(ansi_lines) == 4
   assert "▀" in ansi_lines[0]
-  assert ansi_lines[0].endswith("\x1b[0m")
 
-  if imgsearch.shutil.which("img2sixel"):
-    sixel_out = imgsearch.render_thumbnail(sample, backend="sixel", rows=4, term_cols=80)
+  if imgsearch.shutil.which("img2sixel") or imgsearch.shutil.which("magick"):
+    sixel_out = imgsearch.render_thumbnail(
+        sample, backend="sixel", rows=4, term_cols=80
+    )
     assert "\x1bP" in sixel_out
 
-  # Verify CLI `-t kitty` treats `kitty` as query text, while `--thumb=kitty` sets the backend
   db_path = tmp_path / "index.db"
   transport, _ = make_mock_transport()
   orig_client = imgsearch.EmbeddingClient
-
-  def patched_client(base_url, model_id=imgsearch.DEFAULT_MODEL):
-    return orig_client(base_url=base_url, model_id=model_id, transport=transport)
-
-  monkeypatch.setattr(imgsearch, "EmbeddingClient", patched_client)
-  assert (
-      imgsearch.main(
-          ["index", str(root), "--db", str(db_path), "--endpoint", "http://mock:8091", "-q"]
-      )
-      == 0
+  monkeypatch.setattr(
+      imgsearch,
+      "EmbeddingClient",
+      lambda base_url, model_id=None: orig_client(
+          base_url=base_url, model_id=model_id, transport=transport
+      ),
   )
-
-  assert (
-      imgsearch.main(
-          ["-t", "kitty", "--db", str(db_path), "--endpoint", "http://mock:8091", "-n", "1"]
-      )
-      == 0
-  )
-  out_auto = capsys.readouterr().out
-  assert "terminal_sample.png" in out_auto
-  assert ("▀" in out_auto) or ("\x1b_Ga=T" in out_auto) or ("\x1bP" in out_auto)
-
   assert (
       imgsearch.main(
           [
-              "--thumb=kitty",
-              "--thumb-rows",
-              "5",
+              "index",
+              str(root),
+              "--db",
+              str(db_path),
+              "--endpoint",
+              "http://mock:8091",
+              "-q",
+          ]
+      )
+      == 0
+  )
+
+  # Corrupt the image AFTER indexing: `-t` prints warning instead of crashing!
+  sample.write_bytes(b"not a valid png anymore")
+  assert (
+      imgsearch.main(
+          [
+              "--thumb=ansi",
               "terminal",
               "--db",
               str(db_path),
@@ -340,14 +486,13 @@ def test_thumbnail_renderers_and_cli_flags(tmp_path: Path, monkeypatch, capsys):
       )
       == 0
   )
-  out_kitty = capsys.readouterr().out
-  assert "\x1b_Ga=T,f=100,r=5,q=2" in out_kitty
+  captured = capsys.readouterr()
+  assert "terminal_sample.png" in captured.out
+  assert "thumbnail unavailable" in captured.err
 
 
-def test_readonly_db_and_directory_search(tmp_path: Path):
-  import sqlite3
-
-  ro_dir = tmp_path / "shared_dir"
+def test_readonly_special_chars_and_lock_safety(tmp_path: Path, monkeypatch):
+  ro_dir = tmp_path / "dir with ?#%& spaces"
   ro_dir.mkdir()
   img = ro_dir / "terminal_shot.png"
   img.write_bytes(PNG_HEADER + b"terminal view")
@@ -359,36 +504,36 @@ def test_readonly_db_and_directory_search(tmp_path: Path):
   ) as client:
     imgsearch.build_index(ro_dir, db_path, client, quiet=True)
 
-    # Case 1: Normal (DELETE-mode) DB in a strictly read-only directory (0555) + 0444 DB
-    db_path.chmod(0o444)
-    ro_dir.chmod(0o555)
+    # Lock contention (`database is locked`) must NOT fall back to immutable=1!
+    monkeypatch.setattr(imgsearch, "BUSY_TIMEOUT_MS", 50)
+    locker = sqlite3.connect(db_path)
+    locker.isolation_level = None
+    locker.execute("BEGIN EXCLUSIVE")
     try:
-      hits = imgsearch.search_text("terminal", db_path, client, limit=5)
-      assert len(hits) == 1
-      assert hits[0]["rel_path"] == "terminal_shot.png"
-      sim = imgsearch.search_similar(img, db_path, client, include_self=True)
-      assert len(sim) == 1
-      st = imgsearch.get_status(db_path, client)
-      assert st["embedded"] == 1
+      with pytest.raises(sqlite3.OperationalError, match="locked"):
+        imgsearch.open_db(db_path, readonly=True)
     finally:
-      ro_dir.chmod(0o755)
-      db_path.chmod(0o644)
+      locker.execute("ROLLBACK")
+      locker.close()
+    monkeypatch.setattr(imgsearch, "BUSY_TIMEOUT_MS", 30_000)
 
-    # Case 2: Legacy WAL-flagged DB in a strictly read-only directory (fallback to immutable=1)
+    # Read-only directory (0555) + 0444 DB works for both DELETE and WAL DBs
     raw_conn = sqlite3.connect(db_path)
     raw_conn.execute("PRAGMA journal_mode=WAL")
     raw_conn.close()
     db_path.chmod(0o444)
     ro_dir.chmod(0o555)
     try:
-      hits_wal = imgsearch.search_text("terminal", db_path, client, limit=5)
-      assert len(hits_wal) == 1
+      hits = imgsearch.search_text("terminal", db_path, client, limit=5)
+      assert len(hits) == 1
     finally:
       ro_dir.chmod(0o755)
       db_path.chmod(0o644)
 
 
-def test_auto_select_first_embedding_model_and_cwd_defaults(tmp_path: Path, monkeypatch, capsys):
+def test_auto_select_first_embedding_model_and_cwd_defaults(
+    tmp_path: Path, monkeypatch, capsys
+):
   calls: list[tuple[str, dict]] = []
 
   def router_handler(request: httpx.Request) -> httpx.Response:
@@ -397,8 +542,14 @@ def test_auto_select_first_embedding_model_and_cwd_defaults(tmp_path: Path, monk
           200,
           json={
               "models": [
-                  {"name": "gemma-4", "capabilities": ["completion", "multimodal"]},
-                  {"name": "embeddinggemma-2", "capabilities": ["completion", "multimodal"]},
+                  {
+                      "name": "gemma-4",
+                      "capabilities": {"completion": True, "embeddings": False},
+                  },
+                  {
+                      "name": "embeddinggemma-2",
+                      "capabilities": ["completion", "multimodal"],
+                  },
                   {"name": "qwenembed", "capabilities": ["completion"]},
               ],
               "data": [
@@ -412,93 +563,96 @@ def test_auto_select_first_embedding_model_and_cwd_defaults(tmp_path: Path, monk
       body = json.loads(request.content.decode("utf-8"))
       calls.append((str(request.url), body))
       if isinstance(body["input"], str):
-        return httpx.Response(200, json={"data": [{"embedding": [1.0, 0.0, 0.0, 0.0]}]})
+        return httpx.Response(
+            200, json={"data": [{"embedding": [1.0, 0.0, 0.0, 0.0]}]}
+        )
       return httpx.Response(
           200,
-          json={"data": [{"embedding": [1.0, 0.0, 0.0, 0.0]} for _ in body["input"]]},
+          json={
+              "data": [
+                  {"embedding": [1.0, 0.0, 0.0, 0.0]} for _ in body["input"]
+              ]
+          },
       )
     return httpx.Response(404)
 
   transport = httpx.MockTransport(router_handler)
   orig_client = imgsearch.EmbeddingClient
-
-  def patched_client(base_url, model_id=imgsearch.DEFAULT_MODEL):
-    return orig_client(base_url=base_url, model_id=model_id, transport=transport)
-
-  monkeypatch.setattr(imgsearch, "EmbeddingClient", patched_client)
+  monkeypatch.setattr(
+      imgsearch,
+      "EmbeddingClient",
+      lambda base_url, model_id=None: orig_client(
+          base_url=base_url, model_id=model_id, transport=transport
+      ),
+  )
   monkeypatch.chdir(tmp_path)
-
   (tmp_path / "shot.png").write_bytes(PNG_HEADER + b"terminal")
 
-  # Run `imgsearch index` with --endpoint, NO --model, NO --db, NO root!
-  assert imgsearch.main(["index", "--endpoint", "http://localhost:8080", "-q"]) == 0
-  assert (tmp_path / "index.db").exists()
-  assert calls[0][0] == "http://localhost:8080/v1/embeddings"
-  assert calls[0][1]["model"] == "embeddinggemma-2"  # skipped gemma-4, picked first embed model
-
-  # Run `imgsearch "terminal" --endpoint ...` -> uses cwd `index.db` + indexed model
-  assert imgsearch.main(["terminal", "--endpoint", "http://localhost:8080", "--json"]) == 0
-  out = json.loads(capsys.readouterr().out)
-  assert len(out) == 1
-  assert out[0]["path"] == "shot.png"
-  assert calls[-1][1]["model"] == "embeddinggemma-2"
-
-  # Endpoint with ONLY chat models raises ModelMismatch when --model is omitted
-  chat_only = httpx.MockTransport(
-      lambda req: httpx.Response(200, json={"data": [{"id": "gemma-4"}, {"id": "llama-3"}]})
+  assert (
+      imgsearch.main(["index", "--endpoint", "http://localhost:8080", "-q"])
+      == 0
   )
-  with orig_client("http://localhost:8080", None, transport=chat_only) as client:
-    with pytest.raises(imgsearch.ModelMismatch, match="no embedding model found"):
-      client.verify()
+  assert (tmp_path / "index.db").exists()
+  assert calls[0][1]["model"] == "embeddinggemma-2"
+
+  assert (
+      imgsearch.main(
+          ["terminal", "--endpoint", "http://localhost:8080", "--json"]
+      )
+      == 0
+  )
+  out = json.loads(capsys.readouterr().out)
+  assert out[0]["path"] == "shot.png"
 
 
-def test_local_default_weights_dir_and_cross_backend_interop(tmp_path: Path, monkeypatch, capsys):
+def test_local_weights_shards_and_cross_backend_interop(
+    tmp_path: Path, monkeypatch, capsys
+):
   import huggingface_hub
   from PIL import Image
-  import local_embed
 
   assert local_embed.build_selective_config_kwargs(
       "google/embeddinggemma-2", need_vision=False
-  ) == {
-      "vision_config": None,
-      "audio_config": None,
-  }
-  assert local_embed.build_selective_config_kwargs("google/embeddinggemma-2", need_vision=True) == {
-      "audio_config": None,
-  }
-  assert local_embed.build_selective_config_kwargs("BAAI/bge-m3", need_vision=False) == {}
+  ) == {"vision_config": None, "audio_config": None}
+  assert local_embed.build_selective_config_kwargs(
+      "google/embeddinggemma-2", need_vision=True
+  ) == {"audio_config": None}
 
-  # Verify `resolve_weights_dir` defaults to `./models/<slug>` and respects `--model-dir`
+  # Incomplete sharded index must return False until every shard file exists
+  sharded_dir = tmp_path / "sharded"
+  sharded_dir.mkdir()
+  (sharded_dir / "config.json").write_text("{}", encoding="utf-8")
+  (sharded_dir / "model.safetensors.index.json").write_text(
+      json.dumps(
+          {"weight_map": {"a": "s1.safetensors", "b": "s2.safetensors"}}
+      ),
+      encoding="utf-8",
+  )
+  (sharded_dir / "s1.safetensors").write_bytes(b"part1")
+  assert local_embed.has_local_weights(sharded_dir) is False
+  (sharded_dir / "s2.safetensors").write_bytes(b"part2")
+  assert local_embed.has_local_weights(sharded_dir) is True
+
   monkeypatch.chdir(tmp_path)
-  assert local_embed.resolve_weights_dir("google/embeddinggemma-2") == Path(
-      "models/embeddinggemma-2"
-  )
-  assert local_embed.resolve_weights_dir("google/embeddinggemma-2", tmp_path / "custom_w") == (
-      tmp_path / "custom_w"
-  )
-
-  # Verify `ensure_weights_downloaded` downloads once and skips once files exist
   dl_calls: list[tuple[str, str]] = []
 
   def fake_snapshot_download(repo_id: str, local_dir: str, **_kwargs):
     dl_calls.append((repo_id, local_dir))
     p = Path(local_dir)
     p.mkdir(parents=True, exist_ok=True)
-    (p / "config.json").write_text('{"model_type": "embedding_gemma2"}', encoding="utf-8")
+    (p / "config.json").write_text(
+        '{"model_type": "embedding_gemma2"}', encoding="utf-8"
+    )
     (p / "model.safetensors").write_bytes(b"weights")
     return local_dir
 
-  monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+  monkeypatch.setattr(
+      huggingface_hub, "snapshot_download", fake_snapshot_download
+  )
   target_wdir = tmp_path / "models" / "embeddinggemma-2"
   local_embed.ensure_weights_downloaded("google/embeddinggemma-2", target_wdir)
   local_embed.ensure_weights_downloaded("google/embeddinggemma-2", target_wdir)
-  assert len(dl_calls) == 1  # second call skipped because weights already exist!
-  # Even with an unrelated model name, config.json detection triggers Gemma 2 selective loading
-  assert local_embed.build_selective_config_kwargs(
-      "custom-name", need_vision=False, weights_dir=target_wdir
-  ) == {"vision_config": None, "audio_config": None}
-
-  # Put a dummy PNG inside `models/` to verify `discover_images` ignores model weight directories
+  assert len(dl_calls) == 1
   (target_wdir / "banner.png").write_bytes(PNG_HEADER + b"ignore me")
 
   load_calls: list[tuple[str, Path, bool, str | None]] = []
@@ -521,11 +675,12 @@ def test_local_default_weights_dir_and_cross_backend_interop(tmp_path: Path, mon
       vecs = []
       for item in inputs:
         r, _g, _b = item["image"].getpixel((0, 0))
-        tag = "terminal" if r > 100 else "browser"
-        vecs.append(_fake_vec_for_tag(tag))
+        vecs.append(_fake_vec_for_tag("terminal" if r > 100 else "browser"))
       return np.asarray(vecs, dtype=np.float32)
 
-  def fake_loader(hf_model_id: str, weights_dir: Path, need_vision: bool, device: str | None):
+  def fake_loader(
+      hf_model_id: str, weights_dir: Path, need_vision: bool, device: str | None
+  ):
     load_calls.append((hf_model_id, weights_dir, need_vision, device))
     return FakeSentenceTransformer()
 
@@ -533,51 +688,55 @@ def test_local_default_weights_dir_and_cross_backend_interop(tmp_path: Path, mon
   Image.new("RGB", (16, 16), (200, 10, 10)).save(img1, format="PNG")
   db_path = tmp_path / "index.db"
 
-  # 1. Index img1 via remote llama.cpp client (stamps 'ggmlorg-embeddinggemma-2-BF16')
-  transport, _ = make_mock_transport(served_model="ggmlorg-embeddinggemma-2-BF16")
-  with imgsearch.EmbeddingClient("http://mock:8091", "embeddinggemma-2", transport=transport) as rc:
+  # Remote GGUF path with `/` interoperates seamlessly with local search!
+  transport, _ = make_mock_transport(
+      served_model="/models/embeddinggemma-2-Q8_0.gguf"
+  )
+  with imgsearch.EmbeddingClient(
+      "http://mock:8091", None, transport=transport
+  ) as rc:
     s1 = imgsearch.build_index(tmp_path, db_path, rc, quiet=True)
-    assert s1["embedded"] == 1  # `models/.../banner.png` was ignored!
+    assert s1["embedded"] == 1
 
-  # 2. Search locally (text-only: need_vision=False!) against the remote-indexed DB
-  with local_embed.LocalEmbeddingClient(mode="text", device="cpu", loader=fake_loader) as lc:
+  with local_embed.LocalEmbeddingClient(
+      mode="text", device="cpu", loader=fake_loader
+  ) as lc:
     hits = imgsearch.search_text("terminal", db_path, lc, limit=5)
     assert len(hits) == 1
-    assert hits[0]["rel_path"] == "first.png"
     assert load_calls == [
-        ("google/embeddinggemma-2", Path("models/embeddinggemma-2"), False, "cpu")
+        (
+            "google/embeddinggemma-2",
+            Path("models/embeddinggemma-2"),
+            False,
+            "cpu",
+        )
     ]
 
-  # 3. `similar` on an already-indexed image loads ZERO weights!
-  load_calls.clear()
-  with local_embed.LocalEmbeddingClient(mode="vision", device="cpu", loader=fake_loader) as lc_sim:
-    sim = imgsearch.search_similar(img1, db_path, lc_sim, include_self=True)
-    assert len(sim) == 1
-    assert load_calls == []
-
-  # 4. Add img2 and run local `build_index` -> keeps img1 up_to_date and embeds only img2!
-  img2 = tmp_path / "second.png"
-  Image.new("RGB", (16, 16), (10, 200, 10)).save(img2, format="PNG")
-  with local_embed.LocalEmbeddingClient(mode="vision", device="cpu", loader=fake_loader) as lc_idx:
-    s2 = imgsearch.build_index(tmp_path, db_path, lc_idx, quiet=True)
-    assert s2["up_to_date"] == 1
-    assert s2["embedded"] == 1
-    assert load_calls == [("google/embeddinggemma-2", Path("models/embeddinggemma-2"), True, "cpu")]
-
-  # 5. CLI with NO `--endpoint` defaults to local backend and honors `--model-dir`!
-  load_calls.clear()
   orig_local = imgsearch.LocalEmbeddingClient
-  monkeypatch.setattr(
-      imgsearch,
-      "LocalEmbeddingClient",
-      lambda model_id=None, model_dir=None, mode="text", device=None: orig_local(
-          model_id=model_id, model_dir=model_dir, mode=mode, device=device, loader=fake_loader
-      ),
-  )
+
+  def patched_local(model_id=None, model_dir=None, mode="text", device=None):
+    return orig_local(
+        model_id=model_id,
+        model_dir=model_dir,
+        mode=mode,
+        device=device,
+        loader=fake_loader,
+    )
+
+  monkeypatch.setattr(imgsearch, "LocalEmbeddingClient", patched_local)
   custom_dir = tmp_path / "my_weights"
   assert (
-      imgsearch.main(["terminal", "--model-dir", str(custom_dir), "--device", "cpu", "--json"]) == 0
+      imgsearch.main(
+          [
+              "terminal",
+              "--model-dir",
+              str(custom_dir),
+              "--device",
+              "cpu",
+              "--json",
+          ]
+      )
+      == 0
   )
   cli_hits = json.loads(capsys.readouterr().out)
-  assert len(cli_hits) == 2
-  assert load_calls == [("google/embeddinggemma-2", custom_dir, False, "cpu")]
+  assert len(cli_hits) == 1

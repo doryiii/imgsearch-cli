@@ -1,4 +1,4 @@
-"""Remote HTTP embedding backend for llama.cpp / OpenAI-compatible `/v1/embeddings` servers."""
+"""Remote HTTP backend for llama.cpp / OpenAI `/v1/embeddings` servers."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from embed_base import (
     ItemRejected,
     ModelMismatch,
     QUERY_PREFIX,
+    canonical_model_id,
+    models_compatible,
     normalize,
 )
 
@@ -24,13 +26,38 @@ MODELS_PATH = "/v1/models"
 PROBE_TIMEOUT = 5.0
 REQUEST_TIMEOUT = 300.0
 
-EMBED_NAME_TOKENS = ("embed", "bge-", "bge_", "e5-", "gte-", "siglip", "jina-clip")
+EMBED_NAME_TOKENS = (
+    "embed",
+    "bge-",
+    "bge_",
+    "e5-",
+    "gte-",
+    "siglip",
+    "jina-clip",
+)
+SYSTEMIC_HTTP_CODES = {401, 403, 404, 405, 408, 429, 501}
 
 
-def _parse_models(payload: dict) -> list[dict]:
-  """Normalize OpenAI `data[]` and llama.cpp/Ollama `models[]` entries in list order."""
-  raw_data = payload.get("data") if isinstance(payload.get("data"), list) else []
-  raw_models = payload.get("models") if isinstance(payload.get("models"), list) else []
+def _as_str_list(val) -> list[str]:
+  if isinstance(val, list):
+    return [str(v) for v in val if v]
+  if isinstance(val, str) and val:
+    return [val]
+  if isinstance(val, dict):
+    return [str(k) for k, enabled in val.items() if k and enabled]
+  return []
+
+
+def _parse_models(payload: object) -> list[dict]:
+  """Normalize OpenAI `data[]` and llama.cpp/Ollama `models[]` entries."""
+  if not isinstance(payload, dict):
+    raise ValueError("expected JSON object from /v1/models")
+  raw_data = (
+      payload.get("data") if isinstance(payload.get("data"), list) else []
+  )
+  raw_models = (
+      payload.get("models") if isinstance(payload.get("models"), list) else []
+  )
 
   models_by_id: dict[str, dict] = {}
   for m in raw_models:
@@ -50,28 +77,44 @@ def _parse_models(payload: dict) -> list[dict]:
     model_id = str(model_id)
     companion = models_by_id.get(model_id) or (
         raw_models[idx]
-        if raw_data and idx < len(raw_models) and isinstance(raw_models[idx], dict)
+        if raw_data
+        and idx < len(raw_models)
+        and isinstance(raw_models[idx], dict)
         else {}
     )
-    arch = item.get("architecture") if isinstance(item.get("architecture"), dict) else {}
+    arch = (
+        item.get("architecture")
+        if isinstance(item.get("architecture"), dict)
+        else {}
+    )
     status = item.get("status") if isinstance(item.get("status"), dict) else {}
-    details = companion.get("details") if isinstance(companion.get("details"), dict) else {}
-    raw_caps = companion.get("capabilities") or item.get("capabilities") or []
-    raw_tags = (item.get("tags") or []) + (companion.get("tags") or [])
-    raw_aliases = item.get("aliases") or companion.get("aliases") or []
-    raw_args = status.get("args") or []
+    details = (
+        companion.get("details")
+        if isinstance(companion.get("details"), dict)
+        else {}
+    )
+    caps = _as_str_list(companion.get("capabilities")) or _as_str_list(
+        item.get("capabilities")
+    )
+    tags = _as_str_list(item.get("tags")) + _as_str_list(companion.get("tags"))
+    aliases = _as_str_list(item.get("aliases")) or _as_str_list(
+        companion.get("aliases")
+    )
+    args = _as_str_list(status.get("args"))
 
     parsed.append(
         {
             "id": model_id,
-            "aliases": [str(a) for a in raw_aliases if a],
-            "capabilities": [str(c).lower() for c in raw_caps if c],
-            "type": str(companion.get("type") or item.get("type") or "").lower(),
-            "tags": [str(t).lower() for t in raw_tags if t],
+            "aliases": aliases,
+            "capabilities": [c.lower() for c in caps],
+            "type": str(
+                companion.get("type") or item.get("type") or ""
+            ).lower(),
+            "tags": [t.lower() for t in tags],
             "output_modalities": [
-                str(x).lower() for x in (arch.get("output_modalities") or []) if x
+                m.lower() for m in _as_str_list(arch.get("output_modalities"))
             ],
-            "status_args": [str(a).lower() for a in raw_args if a],
+            "status_args": [a.lower() for a in args],
             "family": str(details.get("family") or "").lower(),
         }
     )
@@ -97,6 +140,28 @@ def _is_embedding_model(entry: dict) -> bool:
     if any(tok in low for tok in EMBED_NAME_TOKENS):
       return True
   return False
+
+
+def _match_requested_model(needle: str, entries: list[dict]) -> str | None:
+  """Match `needle` against `/v1/models`, preferring exact & embed models."""
+  low = needle.strip().lower()
+  for e in entries:
+    if e["id"].lower() == low or any(a.lower() == low for a in e["aliases"]):
+      return e["id"]
+  for e in entries:
+    if models_compatible(needle, e["id"]) or any(
+        models_compatible(needle, a) for a in e["aliases"]
+    ):
+      return e["id"]
+  for e in entries:
+    if _is_embedding_model(e) and (
+        low in e["id"].lower() or any(low in a.lower() for a in e["aliases"])
+    ):
+      return e["id"]
+  for e in entries:
+    if low in e["id"].lower() or any(low in a.lower() for a in e["aliases"]):
+      return e["id"]
+  return None
 
 
 class EmbeddingClient:
@@ -129,27 +194,21 @@ class EmbeddingClient:
     self.close()
 
   def probe(self) -> dict:
-    """Query GET /v1/models for reachability and resolve target or first embedding model."""
+    """Query GET /v1/models for reachability and resolve target model."""
     try:
-      resp = self._client.get(self.base_url + MODELS_PATH, timeout=PROBE_TIMEOUT)
+      resp = self._client.get(
+          self.base_url + MODELS_PATH, timeout=PROBE_TIMEOUT
+      )
       resp.raise_for_status()
       entries = _parse_models(resp.json())
       available = [e["id"] for e in entries]
       embed_models = [e["id"] for e in entries if _is_embedding_model(e)]
 
       if self.model_id:
-        needle = self.model_id.lower()
-        matched = next(
-            (
-                e["id"]
-                for e in entries
-                if needle in e["id"].lower() or any(needle in a.lower() for a in e["aliases"])
-            ),
-            None,
-        )
+        matched = _match_requested_model(self.model_id, entries)
         return {
             "reachable": True,
-            "served_model": matched or (available[0] if available else None),
+            "served_model": matched,
             "available_models": available,
             "embedding_models": embed_models,
             "matches": matched is not None,
@@ -163,7 +222,14 @@ class EmbeddingClient:
           "embedding_models": embed_models,
           "matches": selected is not None,
       }
-    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+    except (
+        httpx.HTTPError,
+        ValueError,
+        KeyError,
+        IndexError,
+        TypeError,
+        AttributeError,
+    ) as exc:
       return {
           "reachable": False,
           "served_model": None,
@@ -174,7 +240,7 @@ class EmbeddingClient:
       }
 
   def verify(self) -> str:
-    """Ensure endpoint is reachable and serves the expected (or an embedding) model."""
+    """Ensure endpoint is reachable and serves the expected model."""
     info = self.probe()
     if not info["reachable"]:
       detail = f": {info['error']}" if info.get("error") else ""
@@ -183,15 +249,15 @@ class EmbeddingClient:
       avail = ", ".join(info["available_models"]) or "none"
       if self.model_id is None:
         raise ModelMismatch(
-            f"no embedding model found at {self.base_url} (available: {avail}); "
-            "pass --model to specify one"
+            f"no embedding model found at {self.base_url} "
+            f"(available: {avail}); pass --model to specify one"
         )
       raise ModelMismatch(
-          f"model {self.model_id!r} not found at {self.base_url} (available: {avail})"
+          f"model {self.model_id!r} not found at {self.base_url} "
+          f"(available: {avail})"
       )
     self.served_model = info["served_model"]
-    if self.model_id is None:
-      self.model_id = self.served_model
+    self.model_id = canonical_model_id(self.served_model)
     self._verified = True
     return self.served_model
 
@@ -201,30 +267,27 @@ class EmbeddingClient:
       return []
     if not self._verified:
       self.verify()
-    payload = {
-        "model": self.served_model,
-        "input": [
-            {
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-                        },
-                    }
-                ]
-            }
-            for raw, mime in items
-        ],
-    }
+    content_items = []
+    for raw, mime in items:
+      b64 = base64.b64encode(raw).decode("ascii")
+      url = f"data:{mime};base64,{b64}"
+      content_items.append(
+          {"content": [{"type": "image_url", "image_url": {"url": url}}]}
+      )
+    payload = {"model": self.served_model, "input": content_items}
     vectors = self._post(payload, expected=len(items))
     return [normalize(v) for v in vectors]
 
   def embed_text(self, query: str) -> np.ndarray:
-    """Embed a search query using EmbeddingGemma's query prefix."""
+    """Embed a search query (applying EmbeddingGemma's prefix on Gemma)."""
     if not self._verified:
       self.verify()
-    vectors = self._post({"model": self.served_model, "input": QUERY_PREFIX + query}, expected=1)
+    served_low = (self.served_model or "").lower()
+    use_prefix = "embeddinggemma" in served_low
+    prompt = (QUERY_PREFIX + query) if use_prefix else query
+    vectors = self._post(
+        {"model": self.served_model, "input": prompt}, expected=1
+    )
     return normalize(vectors[0])
 
   def _post(self, payload: dict, expected: int) -> list:
@@ -232,15 +295,31 @@ class EmbeddingClient:
       resp = self._client.post(self.base_url + EMBED_PATH, json=payload)
     except httpx.HTTPError as exc:
       raise EndpointUnreachable(str(exc)) from exc
-    if resp.status_code >= 500 or resp.status_code in (408, 429):
-      raise EndpointUnreachable(f"HTTP {resp.status_code}: {resp.text[:200]}")
+    body_preview = resp.text[:200]
+    if resp.status_code >= 500 or resp.status_code in SYSTEMIC_HTTP_CODES:
+      raise EndpointUnreachable(f"HTTP {resp.status_code}: {body_preview}")
     if resp.status_code >= 400:
-      raise ItemRejected(f"HTTP {resp.status_code}: {resp.text[:200]}")
+      low_body = body_preview.lower()
+      if "mmproj" in low_body or "image input is not supported" in low_body:
+        raise EndpointUnreachable(
+            f"server missing vision projector (HTTP {resp.status_code}): "
+            f"{body_preview}"
+        )
+      raise ItemRejected(f"HTTP {resp.status_code}: {body_preview}")
     try:
       data = resp.json()["data"]
+      if not isinstance(data, list):
+        raise TypeError("data is not a list")
+      if data and all(
+          isinstance(it, dict) and isinstance(it.get("index"), int)
+          for it in data
+      ):
+        data = sorted(data, key=lambda it: it["index"])
       vectors = [item["embedding"] for item in data]
     except (ValueError, KeyError, TypeError) as exc:
       raise EndpointUnreachable("malformed embedding response") from exc
     if len(vectors) != expected:
-      raise EndpointUnreachable(f"expected {expected} vectors, got {len(vectors)}")
+      raise EndpointUnreachable(
+          f"expected {expected} vectors, got {len(vectors)}"
+      )
     return vectors

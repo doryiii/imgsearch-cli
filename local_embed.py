@@ -1,19 +1,13 @@
-"""Local Hugging Face / SentenceTransformers backend with Selective Encoder Loading.
+"""Local Hugging Face / SentenceTransformers backend.
 
-Weights are downloaded once into a local directory (`./models/<model>` in cwd by default,
-or `--model-dir`) via `huggingface_hub.snapshot_download(local_dir=...)` and loaded
-directly from that directory (`local_files_only=True`) rather than `~/.cache/huggingface`.
-
-For `google/embeddinggemma-2`:
-- Text-only queries (`mode="text"`) pass `config_kwargs={"vision_config": None, "audio_config": None}`
-  to load only the ~270M text backbone + embedder on CPU/GPU.
-- Image indexing / visual similarity (`mode="vision"`) passes `config_kwargs={"audio_config": None}`
-  to load only text + vision (~440M), skipping the ~300M audio tower.
+Weights are downloaded once into `./models/<model>` in cwd (or `--model-dir`)
+and loaded directly from disk (`local_files_only=True`) with Selective Encoder
+Loading (`vision_config=None, audio_config=None` for text queries;
+`audio_config=None` for image indexing).
 """
 
 from __future__ import annotations
 
-import io
 import json
 import os
 from pathlib import Path
@@ -25,6 +19,8 @@ from embed_base import (
     EmbedError,
     ItemRejected,
     QUERY_PREFIX,
+    canonical_model_id,
+    decode_rgb_image,
     is_embeddinggemma2,
     normalize,
     resolve_local_hf_model,
@@ -32,13 +28,20 @@ from embed_base import (
 
 DEFAULT_MODELS_BASE = Path("models")
 DEFAULT_MODEL_DIR = (
-    Path(os.environ["EMBED_MODEL_DIR"]) if os.environ.get("EMBED_MODEL_DIR") else None
+    Path(os.environ["EMBED_MODEL_DIR"])
+    if os.environ.get("EMBED_MODEL_DIR")
+    else None
 )
 DEFAULT_DEVICE = os.environ.get("EMBED_DEVICE") or None
+INSTALL_HINT = (
+    "local mode requires `sentence-transformers>=6.1.0`, "
+    "`transformers>=5.18.0`, `safetensors`, `huggingface-hub`, and `torch` "
+    "(install with `uv pip install -e '.[local]'`)"
+)
 
 
 def _ensure_venv_path() -> None:
-  """Add sibling `.venv` site-packages to `sys.path` if running under bare system Python."""
+  """Add sibling `.venv` site-packages to `sys.path` if needed."""
   venv_root = Path(__file__).resolve().parent / ".venv" / "lib"
   py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
   candidate = venv_root / py_ver / "site-packages"
@@ -47,7 +50,7 @@ def _ensure_venv_path() -> None:
 
 
 def _import_local_ml():
-  """Import `torch` and `SentenceTransformer`, checking sibling `.venv` if needed."""
+  """Import `torch` and `SentenceTransformer`, checking `.venv` if needed."""
   try:
     import torch
     from sentence_transformers import SentenceTransformer
@@ -61,40 +64,72 @@ def _import_local_ml():
 
       return torch, SentenceTransformer
     except ImportError as exc:
-      raise EmbedError(
-          "local mode requires `sentence-transformers>=6.1.0` and `transformers` "
-          "(install with `uv pip install sentence-transformers transformers safetensors`)"
-      ) from exc
+      raise EmbedError(INSTALL_HINT) from exc
 
 
 def _select_device_and_dtype(torch_mod, requested_device: str | None):
-  """Pick execution device and safe precision (`bfloat16` on bf16 CUDA, `float32` on CPU)."""
-  if requested_device:
-    device = requested_device
-  else:
-    device = "cuda" if torch_mod.cuda.is_available() else "cpu"
+  """Pick device and safe dtype (`bfloat16` on bf16 CUDA, `float32` on CPU)."""
+  try:
+    cuda_ok = bool(torch_mod.cuda.is_available())
+    if requested_device:
+      device = requested_device
+      if device.startswith("cuda") and not cuda_ok:
+        raise EmbedError(
+            f"requested device {device!r}, but CUDA is not available"
+        )
+    else:
+      device = "cuda" if cuda_ok else "cpu"
 
-  # EmbeddingGemma 2 overflows float16; use bfloat16 on supported CUDA GPUs and float32 on CPU.
-  if device.startswith("cuda") and torch_mod.cuda.is_bf16_supported():
-    dtype = torch_mod.bfloat16
-  else:
-    dtype = torch_mod.float32
-  return device, dtype
+    if (
+        device.startswith("cuda")
+        and cuda_ok
+        and torch_mod.cuda.is_bf16_supported()
+    ):
+      dtype = torch_mod.bfloat16
+    else:
+      dtype = torch_mod.float32
+    return device, dtype
+  except EmbedError:
+    raise
+  except Exception as exc:
+    raise EmbedError(
+        f"invalid torch device {requested_device!r}: {exc}"
+    ) from exc
 
 
 def has_local_weights(weights_dir: Path) -> bool:
-  """Return True when `weights_dir` already contains downloaded model config and weights."""
+  """Return True when `weights_dir` holds complete config and weight files."""
   if not (weights_dir / "config.json").is_file():
     return False
-  return (
-      any(weights_dir.glob("*.safetensors"))
-      or (weights_dir / "model.safetensors.index.json").is_file()
-      or any(weights_dir.glob("*.bin"))
-  )
+  index_file = weights_dir / "model.safetensors.index.json"
+  if index_file.is_file():
+    try:
+      idx_data = json.loads(index_file.read_text(encoding="utf-8"))
+      weight_map = idx_data.get("weight_map")
+      if not isinstance(weight_map, dict) or not weight_map:
+        return False
+      shards = {str(v) for v in weight_map.values() if v}
+      return bool(shards) and all(
+          (weights_dir / s).is_file() and (weights_dir / s).stat().st_size > 0
+          for s in shards
+      )
+    except (OSError, ValueError):
+      return False
+
+  for pattern in ("*.safetensors", "*.bin"):
+    for f in weights_dir.glob(pattern):
+      try:
+        if f.is_file() and f.stat().st_size > 0:
+          return True
+      except OSError:
+        continue
+  return False
 
 
-def resolve_weights_dir(hf_model_id: str, model_dir: str | Path | None = None) -> Path:
-  """Resolve on-disk directory where model weights should be stored and loaded from."""
+def resolve_weights_dir(
+    hf_model_id: str, model_dir: str | Path | None = None
+) -> Path:
+  """Resolve local directory where model weights are stored and loaded from."""
   candidate_path = Path(hf_model_id)
   if candidate_path.is_dir() and has_local_weights(candidate_path):
     return candidate_path
@@ -107,7 +142,9 @@ def resolve_weights_dir(hf_model_id: str, model_dir: str | Path | None = None) -
   return DEFAULT_MODELS_BASE / slug
 
 
-def _is_gemma2_weights(hf_model_id: str, weights_dir: Path | None = None) -> bool:
+def _is_gemma2_weights(
+    hf_model_id: str, weights_dir: Path | None = None
+) -> bool:
   if is_embeddinggemma2(hf_model_id):
     return True
   if weights_dir is not None:
@@ -127,7 +164,7 @@ def _is_gemma2_weights(hf_model_id: str, weights_dir: Path | None = None) -> boo
 def build_selective_config_kwargs(
     hf_model_id: str, need_vision: bool, weights_dir: Path | None = None
 ) -> dict:
-  """Build `SentenceTransformer(..., config_kwargs=...)` for Selective Encoder Loading."""
+  """Build `config_kwargs` for EmbeddingGemma 2 Selective Encoder Loading."""
   if not _is_gemma2_weights(hf_model_id, weights_dir):
     return {}
   if need_vision:
@@ -136,19 +173,28 @@ def build_selective_config_kwargs(
 
 
 def ensure_weights_downloaded(hf_model_id: str, weights_dir: Path) -> Path:
-  """Download `hf_model_id` directly into `weights_dir` if not already present."""
+  """Download `hf_model_id` into `weights_dir` if not already present."""
   if has_local_weights(weights_dir):
     return weights_dir
+
+  if (
+      hf_model_id.startswith((".", "/", "~"))
+      and not Path(hf_model_id).expanduser().is_dir()
+  ):
+    raise EmbedError(f"local model directory not found: {hf_model_id}")
 
   _ensure_venv_path()
   try:
     from huggingface_hub import snapshot_download
   except ImportError as exc:
     raise EmbedError(
-        "local model download requires `huggingface_hub` (`uv pip install huggingface-hub`)"
+        "model download requires `huggingface-hub` "
+        "(`uv pip install huggingface-hub`)"
     ) from exc
 
-  print(f"Downloading {hf_model_id} weights to {weights_dir} ...", file=sys.stderr)
+  print(
+      f"Downloading {hf_model_id} weights to {weights_dir} ...", file=sys.stderr
+  )
   weights_dir.mkdir(parents=True, exist_ok=True)
   try:
     snapshot_download(
@@ -157,12 +203,14 @@ def ensure_weights_downloaded(hf_model_id: str, weights_dir: Path) -> Path:
         cache_dir=str(weights_dir / ".cache"),
     )
   except Exception as exc:
-    raise EmbedError(f"failed to download {hf_model_id!r} to {weights_dir}: {exc}") from exc
+    raise EmbedError(
+        f"failed to download {hf_model_id!r} to {weights_dir}: {exc}"
+    ) from exc
   return weights_dir
 
 
 class LocalEmbeddingClient:
-  """In-process embedding backend loading weights from `./models/<model>` (or `--model-dir`)."""
+  """In-process backend loading weights from `./models/<model>` on disk."""
 
   is_local = True
 
@@ -179,23 +227,16 @@ class LocalEmbeddingClient:
     self._explicit_model = model_id is not None
     self.hf_model_id = resolve_local_hf_model(model_id)
     self.model_dir = Path(model_dir) if model_dir is not None else None
-    # Canonical model_id defaults to 'embeddinggemma-2' for EmbeddingGemma 2 so indexes are
-    # seamlessly shared between a remote llama.cpp server and local runs.
-    if model_id is not None:
-      self.model_id: str | None = model_id
-    elif is_embeddinggemma2(self.hf_model_id):
-      self.model_id = "embeddinggemma-2"
-    else:
-      self.model_id = self.hf_model_id
-
+    self.model_id: str | None = canonical_model_id(
+        model_id if model_id is not None else self.hf_model_id
+    )
     self.served_model: str | None = self.hf_model_id
     self.mode = mode
     self.device = device
-    self._loader = (
-        loader  # optional test hook: (hf_model_id, weights_dir, need_vision, device) -> model
-    )
+    self._loader = loader
     self._model = None
     self._loaded_vision = False
+    self._loaded_hf_id: str | None = None
 
   @property
   def weights_dir(self) -> Path:
@@ -204,6 +245,7 @@ class LocalEmbeddingClient:
   def close(self) -> None:
     self._model = None
     self._loaded_vision = False
+    self._loaded_hf_id = None
 
   def __enter__(self) -> LocalEmbeddingClient:
     return self
@@ -212,7 +254,7 @@ class LocalEmbeddingClient:
     self.close()
 
   def probe(self) -> dict:
-    """Report local backend status and weights directory without loading weights into RAM."""
+    """Report local backend status without eagerly loading weights into RAM."""
     if self._loader is not None:
       reachable = True
       err = None
@@ -241,25 +283,32 @@ class LocalEmbeddingClient:
     return result
 
   def verify(self) -> str:
-    """Verify local ML dependencies are importable (weights remain lazily downloaded/loaded)."""
+    """Verify local ML packages are importable (weights load lazily)."""
     if self._loader is None:
       _import_local_ml()
     if self.model_id is None:
-      self.model_id = (
-          "embeddinggemma-2" if is_embeddinggemma2(self.hf_model_id) else self.hf_model_id
-      )
+      self.model_id = canonical_model_id(self.hf_model_id)
     self.served_model = self.hf_model_id
     return self.served_model
 
   def _ensure_loaded(self, need_vision: bool):
-    if self._model is not None and (self._loaded_vision or not need_vision):
+    if (
+        self._model is not None
+        and self._loaded_hf_id == self.hf_model_id
+        and (self._loaded_vision or not need_vision)
+    ):
       return self._model
 
+    # Drop any prior text-only model before allocating a larger vision model.
+    self._model = None
     target_vision = need_vision or (self.mode == "vision")
     wdir = self.weights_dir
     if self._loader is not None:
-      self._model = self._loader(self.hf_model_id, wdir, target_vision, self.device)
+      self._model = self._loader(
+          self.hf_model_id, wdir, target_vision, self.device
+      )
       self._loaded_vision = target_vision
+      self._loaded_hf_id = self.hf_model_id
       return self._model
 
     torch_mod, st_cls = _import_local_ml()
@@ -270,8 +319,8 @@ class LocalEmbeddingClient:
     except Exception:
       pass
 
-    ensure_weights_downloaded(self.hf_model_id, wdir)
     resolved_device, dtype = _select_device_and_dtype(torch_mod, self.device)
+    ensure_weights_downloaded(self.hf_model_id, wdir)
     config_kwargs = build_selective_config_kwargs(
         self.hf_model_id, need_vision=target_vision, weights_dir=wdir
     )
@@ -289,10 +338,11 @@ class LocalEmbeddingClient:
       ) from exc
 
     self._loaded_vision = target_vision
+    self._loaded_hf_id = self.hf_model_id
     return self._model
 
   def embed_text(self, query: str) -> np.ndarray:
-    """Encode a text search query using only the text encoder when `mode='text'`."""
+    """Encode a search query using only the text encoder when `mode='text'`."""
     model = self._ensure_loaded(need_vision=False)
     prompts = getattr(model, "prompts", None) or {}
     if "SearchQuery" in prompts:
@@ -303,9 +353,22 @@ class LocalEmbeddingClient:
           convert_to_numpy=True,
           show_progress_bar=False,
       )
-    else:
+    elif "query" in prompts:
       vec = model.encode(
-          QUERY_PREFIX + query,
+          query,
+          prompt_name="query",
+          normalize_embeddings=True,
+          convert_to_numpy=True,
+          show_progress_bar=False,
+      )
+    else:
+      use_prefix = (
+          _is_gemma2_weights(self.hf_model_id, self.weights_dir)
+          or "embeddinggemma" in self.hf_model_id.lower()
+      )
+      text = (QUERY_PREFIX + query) if use_prefix else query
+      vec = model.encode(
+          text,
           normalize_embeddings=True,
           convert_to_numpy=True,
           show_progress_bar=False,
@@ -313,19 +376,15 @@ class LocalEmbeddingClient:
     return normalize(vec)
 
   def embed_images(self, items: list[tuple[bytes, str]]) -> list[np.ndarray]:
-    """Encode a batch of `(raw_bytes, mime)` images using text + vision encoders."""
+    """Encode `(raw_bytes, mime)` images using text + vision encoders."""
     if not items:
       return []
-    try:
-      from PIL import Image, ImageOps
-    except ImportError as exc:
-      raise EmbedError("Pillow is required to decode images for local embedding") from exc
-
     pil_inputs: list[dict] = []
     for raw, _mime in items:
       try:
-        with Image.open(io.BytesIO(raw)) as im:
-          rgb = ImageOps.exif_transpose(im).convert("RGB")
+        rgb = decode_rgb_image(raw)
+      except EmbedError:
+        raise
       except Exception as exc:
         raise ItemRejected(f"invalid image payload: {exc}") from exc
       pil_inputs.append({"image": rgb})
@@ -340,6 +399,8 @@ class LocalEmbeddingClient:
           show_progress_bar=False,
       )
     except Exception as exc:
-      raise ItemRejected(f"local image encoding failed: {exc}") from exc
+      if len(pil_inputs) > 1:
+        raise ItemRejected(f"batch image encoding failed: {exc}") from exc
+      raise EmbedError(f"local image encoding failed: {exc}") from exc
 
     return [normalize(v) for v in vecs]
