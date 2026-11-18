@@ -471,10 +471,14 @@ def build_index(
                   digest,
                   size,
                   mtime_ns,
-                  client.model_id,
+                  str(client.model_id),
                   str(exc),
               )
               failed += 1
+              if not quiet:
+                safe_p = sanitize_tty_text(rel_path)
+                sys.stderr.write(f"\rSkipping {safe_p}: {exc}\n")
+                sys.stderr.flush()
 
       if not quiet and total_todo > 0:
         done = min(start + len(chunk), total_todo)

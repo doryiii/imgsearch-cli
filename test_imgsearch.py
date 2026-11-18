@@ -277,6 +277,63 @@ def test_batch_rejection_systemic_errors_and_out_of_order_index(tmp_path: Path):
     assert list(vecs[1]) == pytest.approx([0.0, 1.0])
 
 
+def test_llama_cpp_http_500_image_decode_fallback_and_transcode(tmp_path: Path):
+  import io
+  from PIL import Image
+
+  root = tmp_path / "photos"
+  root.mkdir()
+  # 1. Valid standard PNG
+  buf_ok = io.BytesIO()
+  Image.new("RGB", (16, 16), (10, 200, 10)).save(buf_ok, format="PNG")
+  (root / "01_ok.png").write_bytes(buf_ok.getvalue())
+
+  # 2. TIFF disguised as .jpg: stb_image 500s, Pillow transcodes to PNG -> OK!
+  buf_tiff = io.BytesIO()
+  Image.new("RGB", (16, 16), (200, 10, 10)).save(buf_tiff, format="TIFF")
+  (root / "02_quirky.jpg").write_bytes(buf_tiff.getvalue())
+
+  # 3. Truly corrupt file: both stb_image (500) and Pillow fail -> marked error
+  (root / "03_corrupt.png").write_bytes(PNG_HEADER + b"truncated garbage")
+
+  llama_500 = {
+      "error": {
+          "code": 500,
+          "message": "Failed to load image or audio file",
+          "type": "server_error",
+      }
+  }
+
+  def handler(req: httpx.Request) -> httpx.Response:
+    if req.url.path == "/v1/models":
+      return httpx.Response(200, json={"data": [{"id": "embeddinggemma-2"}]})
+    payload = json.loads(req.content.decode("utf-8"))
+    out = []
+    for item in payload["input"]:
+      url = item["content"][0]["image_url"]["url"]
+      raw = base64.b64decode(url.split(",", 1)[1])
+      # Only accept valid PNGs that Pillow can open (simulating stb_image)
+      if not raw.startswith(PNG_HEADER) or b"truncated garbage" in raw:
+        return httpx.Response(500, json=llama_500)
+      out.append({"embedding": [1.0, 0.0, 0.0, 0.0]})
+    return httpx.Response(200, json={"data": out})
+
+  db_path = tmp_path / "index.db"
+  with imgsearch.EmbeddingClient(
+      "http://mock:8091", None, transport=httpx.MockTransport(handler)
+  ) as client:
+    s1 = imgsearch.build_index(root, db_path, client, batch_size=8, quiet=True)
+    # 01_ok.png and 02_quirky.jpg (transcoded) succeed; 03_corrupt.png fails
+    assert s1["embedded"] == 2
+    assert s1["failed"] == 1
+
+    # Re-running without --retry-errors skips 03_corrupt.png cleanly
+    s2 = imgsearch.build_index(root, db_path, client, batch_size=8, quiet=True)
+    assert s2["up_to_date"] == 2
+    assert s2["skipped_errors"] == 1
+    assert s2["failed"] == 0
+
+
 def test_cli_argv_normalization_validation_and_modes(
     tmp_path: Path, monkeypatch, capsys
 ):

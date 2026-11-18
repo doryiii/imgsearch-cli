@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import base64
+import io
 import os
 
 import httpx
 import numpy as np
 
 from embed_base import (
+    EmbedError,
     EndpointUnreachable,
     ItemRejected,
     ModelMismatch,
     QUERY_PREFIX,
     canonical_model_id,
+    decode_rgb_image,
     models_compatible,
     normalize,
 )
@@ -36,6 +39,31 @@ EMBED_NAME_TOKENS = (
     "jina-clip",
 )
 SYSTEMIC_HTTP_CODES = {401, 403, 404, 405, 408, 429, 501}
+# llama.cpp returns HTTP 500 (not 400) when stb_image/mtmd fails on a bad file.
+ITEM_REJECTED_HINTS = (
+    "failed to load image",
+    "failed to decode",
+    "failed to preprocess",
+    "invalid image",
+    "is too large to process",
+)
+TRANSCODE_MAX_DIM = 2048
+
+
+def _transcode_to_png(raw: bytes) -> bytes | None:
+  """Try decoding `raw` with Pillow into a clean 8-bit RGB PNG."""
+  try:
+    from PIL import Image
+
+    rgb = decode_rgb_image(raw)
+    rgb.thumbnail(
+        (TRANSCODE_MAX_DIM, TRANSCODE_MAX_DIM), Image.Resampling.LANCZOS
+    )
+    buf = io.BytesIO()
+    rgb.save(buf, format="PNG", compress_level=1)
+    return buf.getvalue()
+  except (OSError, ValueError, SyntaxError, EOFError, EmbedError):
+    return None
 
 
 def _as_str_list(val) -> list[str]:
@@ -261,12 +289,7 @@ class EmbeddingClient:
     self._verified = True
     return self.served_model
 
-  def embed_images(self, items: list[tuple[bytes, str]]) -> list[np.ndarray]:
-    """Embed a batch of `(raw_bytes, mime_type)` image items."""
-    if not items:
-      return []
-    if not self._verified:
-      self.verify()
+  def _build_image_payload(self, items: list[tuple[bytes, str]]) -> dict:
     content_items = []
     for raw, mime in items:
       b64 = base64.b64encode(raw).decode("ascii")
@@ -274,8 +297,27 @@ class EmbeddingClient:
       content_items.append(
           {"content": [{"type": "image_url", "image_url": {"url": url}}]}
       )
-    payload = {"model": self.served_model, "input": content_items}
-    vectors = self._post(payload, expected=len(items))
+    return {"model": self.served_model, "input": content_items}
+
+  def embed_images(self, items: list[tuple[bytes, str]]) -> list[np.ndarray]:
+    """Embed a batch of `(raw_bytes, mime_type)` image items."""
+    if not items:
+      return []
+    if not self._verified:
+      self.verify()
+    payload = self._build_image_payload(items)
+    try:
+      vectors = self._post(payload, expected=len(items))
+    except ItemRejected:
+      if len(items) != 1:
+        raise
+      # On single-item fallback, re-encode via Pillow in case llama.cpp's
+      # stb_image choked on an unusual valid image (e.g. 16-bit/CMYK/huge).
+      reencoded = _transcode_to_png(items[0][0])
+      if reencoded is None:
+        raise
+      retry_payload = self._build_image_payload([(reencoded, "image/png")])
+      vectors = self._post(retry_payload, expected=1)
     return [normalize(v) for v in vectors]
 
   def embed_text(self, query: str) -> np.ndarray:
@@ -296,10 +338,14 @@ class EmbeddingClient:
     except httpx.HTTPError as exc:
       raise EndpointUnreachable(str(exc)) from exc
     body_preview = resp.text[:200]
+    low_body = body_preview.lower()
+    if resp.status_code >= 500 and any(
+        hint in low_body for hint in ITEM_REJECTED_HINTS
+    ):
+      raise ItemRejected(f"HTTP {resp.status_code}: {body_preview}")
     if resp.status_code >= 500 or resp.status_code in SYSTEMIC_HTTP_CODES:
       raise EndpointUnreachable(f"HTTP {resp.status_code}: {body_preview}")
     if resp.status_code >= 400:
-      low_body = body_preview.lower()
       if "mmproj" in low_body or "image input is not supported" in low_body:
         raise EndpointUnreachable(
             f"server missing vision projector (HTTP {resp.status_code}): "
